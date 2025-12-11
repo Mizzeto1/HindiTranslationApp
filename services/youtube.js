@@ -39,7 +39,7 @@ async function getVideoDuration(youtubeUrl) {
     console.log('[YOUTUBE] Getting video duration...');
 
     const { stdout } = await execPromise(
-      `yt-dlp --get-duration "${youtubeUrl}" 2>/dev/null`,
+      `yt-dlp --get-duration "${youtubeUrl}"`,
       { timeout: 30000 }
     );
 
@@ -85,18 +85,19 @@ async function downloadAudio(youtubeUrl, jobId) {
     // Directory might already exist, that's fine
   }
 
-  const outputPath = path.join(TEMP_DIR, `${jobId}.mp3`);
+  // Use template for output, yt-dlp will add the correct extension
+  const outputTemplate = path.join(TEMP_DIR, `${jobId}.%(ext)s`);
+  const expectedPath = path.join(TEMP_DIR, jobId);
 
   console.log(`[YOUTUBE] Downloading audio from: ${youtubeUrl}`);
-  console.log(`[YOUTUBE] Output path: ${outputPath}`);
+  console.log(`[YOUTUBE] Output template: ${outputTemplate}`);
 
   return new Promise((resolve, reject) => {
-    // yt-dlp command to extract audio as mp3
+    // yt-dlp command to extract audio (keep original format, no conversion needed)
     const args = [
       '-x',                          // Extract audio
-      '--audio-format', 'mp3',       // Convert to mp3
-      '--audio-quality', '0',        // Best quality
-      '-o', outputPath,              // Output path
+      '-f', 'bestaudio[ext=m4a]/bestaudio',  // Prefer m4a, fallback to best
+      '-o', outputTemplate,          // Output path template
       '--no-playlist',               // Don't download playlists
       '--no-warnings',               // Suppress warnings
       youtubeUrl
@@ -104,12 +105,12 @@ async function downloadAudio(youtubeUrl, jobId) {
 
     console.log(`[YOUTUBE] Running: yt-dlp ${args.join(' ')}`);
 
-    const process = spawn('yt-dlp', args);
+    const ytProcess = spawn('yt-dlp', args);
 
     let stdout = '';
     let stderr = '';
 
-    process.stdout.on('data', (data) => {
+    ytProcess.stdout.on('data', (data) => {
       const output = data.toString();
       stdout += output;
       // Log download progress
@@ -118,27 +119,26 @@ async function downloadAudio(youtubeUrl, jobId) {
       }
     });
 
-    process.stderr.on('data', (data) => {
+    ytProcess.stderr.on('data', (data) => {
       stderr += data.toString();
     });
 
-    process.on('close', async (code) => {
+    ytProcess.on('close', async (code) => {
       if (code === 0) {
-        // Check if file exists
+        // Find the downloaded file (could be .m4a, .webm, .opus, etc.)
         try {
-          await fs.access(outputPath);
-          console.log(`[YOUTUBE] Download complete: ${outputPath}`);
-          resolve(outputPath);
-        } catch (err) {
-          // Sometimes yt-dlp adds an extra extension
-          const altPath = `${outputPath}.mp3`;
-          try {
-            await fs.access(altPath);
-            console.log(`[YOUTUBE] Download complete (alt path): ${altPath}`);
-            resolve(altPath);
-          } catch (err2) {
+          const files = await fs.readdir(TEMP_DIR);
+          const audioFile = files.find(f => f.startsWith(jobId));
+
+          if (audioFile) {
+            const finalPath = path.join(TEMP_DIR, audioFile);
+            console.log(`[YOUTUBE] Download complete: ${finalPath}`);
+            resolve(finalPath);
+          } else {
             reject(new Error('Audio file not found after download'));
           }
+        } catch (err) {
+          reject(new Error('Audio file not found after download'));
         }
       } else {
         console.error(`[YOUTUBE] yt-dlp failed with code ${code}`);
@@ -157,14 +157,14 @@ async function downloadAudio(youtubeUrl, jobId) {
       }
     });
 
-    process.on('error', (error) => {
+    ytProcess.on('error', (error) => {
       console.error('[YOUTUBE] Process error:', error);
       reject(new Error(`Failed to start yt-dlp: ${error.message}`));
     });
 
     // Timeout after 5 minutes
     setTimeout(() => {
-      process.kill();
+      ytProcess.kill();
       reject(new Error('Download timed out after 5 minutes'));
     }, 300000);
   });

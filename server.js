@@ -1,8 +1,8 @@
 /**
- * Hindi Translation API - Main Server
+ * YouTube Translation API - Main Server
  *
  * This server accepts YouTube URLs and returns English translations
- * of Hindi audio using Groq's Whisper API.
+ * of Hindi, Punjabi, and other languages using Groq's Whisper API.
  */
 
 require('dotenv').config();
@@ -43,8 +43,9 @@ app.get('/health', (req, res) => {
 // Root endpoint
 app.get('/', (req, res) => {
   res.json({
-    message: 'Hindi Translation API',
+    message: 'YouTube Translation API',
     version: '1.0.0',
+    description: 'Translates Hindi, Punjabi, and 50+ languages to English',
     endpoints: {
       translate: 'POST /api/translate',
       status: 'GET /api/status/:jobId',
@@ -66,7 +67,8 @@ app.use((err, req, res, next) => {
 // Start server
 app.listen(PORT, () => {
   console.log('========================================');
-  console.log('   Hindi Translation API Server');
+  console.log('   YouTube Translation API Server');
+  console.log('   (Hindi, Punjabi, and 50+ languages)');
   console.log('========================================');
   console.log(`Server running on http://localhost:${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);

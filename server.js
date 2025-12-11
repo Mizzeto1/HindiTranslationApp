@@ -16,8 +16,13 @@ const PORT = process.env.PORT || 3001;
 // Middleware
 app.use(cors({
   origin: '*', // Allow all origins for frontend on different domain
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Authorization',
+    'ngrok-skip-browser-warning',
+    'bypass-tunnel-reminder'
+  ]
 }));
 app.use(express.json());
 

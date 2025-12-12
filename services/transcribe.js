@@ -51,10 +51,11 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
 
     // Run both API calls in parallel
     const [transcription, translation] = await Promise.all([
-      // Transcription - gets romanized/original text
+      // Transcription - force Hindi to get romanized/Devanagari output
       groq.audio.transcriptions.create({
         file: fs.createReadStream(audioFilePath),
         model: 'whisper-large-v3',
+        language: 'hi',  // Force Hindi detection to avoid auto-translating
         response_format: 'verbose_json'
       }),
       // Translation - gets English
@@ -127,15 +128,14 @@ function parseSegments(response) {
 
 /**
  * Merge romanized and english segments
- * If transcription is non-Latin (Devanagari/Urdu), use translation for romanized
+ * - If transcription is non-Latin (Devanagari/Urdu), use translation for romanized
+ * - If romanized equals english, set romanized to null (avoid duplicates)
  */
 function mergeSegments(transcribed, translated) {
-  // Use translated segments as base for timing
   const base = translated.length > 0 ? translated : transcribed;
   if (base.length === 0) return [];
 
   return base.map((seg, idx) => {
-    // Get corresponding transcribed segment
     const transcribedSeg = transcribed.length === base.length
       ? transcribed[idx]
       : findClosestSegment(seg.start, transcribed);
@@ -143,10 +143,13 @@ function mergeSegments(transcribed, translated) {
     const transcribedText = transcribedSeg ? transcribedSeg.text : '';
     const translatedText = seg.text;
 
-    // If transcription is non-Latin script, use translation as romanized
-    const romanized = isLatinScript(transcribedText)
-      ? transcribedText
-      : translatedText;
+    // Get romanized text (use translation if transcription is non-Latin)
+    let romanized = isLatinScript(transcribedText) ? transcribedText : translatedText;
+
+    // If romanized is same as english, set to null (no point showing twice)
+    if (romanized.toLowerCase().trim() === translatedText.toLowerCase().trim()) {
+      romanized = null;
+    }
 
     return {
       id: idx,

@@ -17,8 +17,78 @@ const userStorage = require('../services/userStorage');
 const { requireAuth, getUserEmail } = require('../middleware/auth');
 const fs = require('fs').promises;
 
-// YouTube URL validation regex
-const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|embed\/|v\/)|youtu\.be\/)[a-zA-Z0-9_-]{11}/;
+// YouTube URL validation regex - supports various formats including browser URLs with extra params
+// Matches: youtube.com/watch?v=xxx, youtu.be/xxx, youtube.com/embed/xxx, youtube.com/v/xxx
+// Also handles: m.youtube.com, music.youtube.com, and URLs with extra parameters (&list=, &t=, etc.)
+const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com\/(watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)[a-zA-Z0-9_-]{11}/;
+
+/**
+ * Extract and clean YouTube URL to get just the video
+ * Removes playlist params, tracking params, etc.
+ * @param {string} url - Raw YouTube URL from user
+ * @returns {string} - Clean YouTube URL
+ */
+function cleanYouTubeUrl(url) {
+  try {
+    // Handle youtu.be short URLs
+    if (url.includes('youtu.be/')) {
+      const match = url.match(/youtu\.be\/([a-zA-Z0-9_-]{11})/);
+      if (match) {
+        return `https://www.youtube.com/watch?v=${match[1]}`;
+      }
+    }
+
+    // Handle youtube.com URLs
+    const urlObj = new URL(url.startsWith('http') ? url : `https://${url}`);
+
+    // Handle /shorts/ URLs
+    if (urlObj.pathname.includes('/shorts/')) {
+      const videoId = urlObj.pathname.split('/shorts/')[1]?.slice(0, 11);
+      if (videoId) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+      }
+    }
+
+    // Handle /embed/ and /v/ URLs
+    if (urlObj.pathname.includes('/embed/') || urlObj.pathname.includes('/v/')) {
+      const pathParts = urlObj.pathname.split('/');
+      const videoId = pathParts[pathParts.length - 1]?.slice(0, 11);
+      if (videoId) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+      }
+    }
+
+    // Handle standard watch URLs
+    const videoId = urlObj.searchParams.get('v');
+    if (videoId) {
+      return `https://www.youtube.com/watch?v=${videoId}`;
+    }
+
+    // If we can't parse it, return original
+    return url;
+  } catch (error) {
+    console.log('[TRANSLATE] Could not clean URL, using original:', url);
+    return url;
+  }
+}
+
+/**
+ * Extract video ID from any YouTube URL format
+ * @param {string} url - YouTube URL
+ * @returns {string|null} - Video ID or null
+ */
+function extractVideoId(url) {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+    /^([a-zA-Z0-9_-]{11})$/ // Just the video ID itself
+  ];
+
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
 
 /**
  * POST /api/translate
@@ -27,13 +97,13 @@ const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|embe
  */
 router.post('/translate', requireAuth, async (req, res) => {
   try {
-    const { youtubeUrl } = req.body;
+    const { youtubeUrl: rawUrl } = req.body;
     const userId = req.userId;
 
     console.log(`[TRANSLATE] Request from user: ${userId}`);
 
     // Validate request body
-    if (!youtubeUrl) {
+    if (!rawUrl) {
       console.log('[TRANSLATE] Error: No YouTube URL provided');
       return res.status(400).json({
         error: 'Missing required field',
@@ -41,16 +111,20 @@ router.post('/translate', requireAuth, async (req, res) => {
       });
     }
 
-    // Validate YouTube URL format
-    if (!YOUTUBE_URL_REGEX.test(youtubeUrl)) {
-      console.log(`[TRANSLATE] Error: Invalid YouTube URL: ${youtubeUrl}`);
+    // Try to extract video ID to validate it's a YouTube URL
+    const videoId = extractVideoId(rawUrl);
+    if (!videoId) {
+      console.log(`[TRANSLATE] Error: Could not extract video ID from: ${rawUrl}`);
       return res.status(400).json({
         error: 'Invalid URL',
         message: 'Please provide a valid YouTube URL'
       });
     }
 
-    console.log(`[TRANSLATE] Received request for: ${youtubeUrl}`);
+    // Clean the URL to remove extra parameters (playlist, tracking, etc.)
+    const youtubeUrl = cleanYouTubeUrl(rawUrl);
+    console.log(`[TRANSLATE] Original URL: ${rawUrl}`);
+    console.log(`[TRANSLATE] Cleaned URL: ${youtubeUrl}`);
 
     // Get user email and ensure user exists in storage
     const email = await getUserEmail(userId);

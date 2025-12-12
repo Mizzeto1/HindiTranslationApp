@@ -14,6 +14,18 @@ const groq = new Groq({
 });
 
 /**
+ * Check if text is Latin script (romanized)
+ * Returns false for Devanagari, Arabic/Urdu, etc.
+ */
+function isLatinScript(text) {
+  if (!text) return true;
+  // Allow Latin letters, numbers, punctuation, spaces
+  // Block non-Latin scripts (Devanagari, Arabic, etc.)
+  const nonLatinPattern = /[\u0900-\u097F\u0600-\u06FF\u0980-\u09FF\u0A00-\u0A7F]/;
+  return !nonLatinPattern.test(text);
+}
+
+/**
  * Transcribe and translate audio - returns both romanized and English
  * @param {string} audioFilePath - Path to the audio file
  * @param {Object} options - Optional settings
@@ -55,16 +67,18 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
 
     console.log('[TRANSCRIBE] Both API calls complete');
 
-    // Parse segments from transcription (romanized)
-    const romanizedSegments = parseSegments(transcription);
-    console.log(`[TRANSCRIBE] Romanized: ${romanizedSegments.length} segments`);
+    // Parse segments from both responses
+    const transcribedSegments = parseSegments(transcription);
+    const translatedSegments = parseSegments(translation);
 
-    // Parse segments from translation (english)
-    const englishSegments = parseSegments(translation);
-    console.log(`[TRANSCRIBE] English: ${englishSegments.length} segments`);
+    // Check if transcription is Latin script
+    const sampleText = transcribedSegments[0]?.text || '';
+    const isLatin = isLatinScript(sampleText);
+    console.log(`[TRANSCRIBE] Transcription: ${transcribedSegments.length} segments, Latin script: ${isLatin}`);
+    console.log(`[TRANSCRIBE] Translation: ${translatedSegments.length} segments`);
 
-    // Merge segments - use romanized timing, pair with english
-    const merged = mergeSegments(romanizedSegments, englishSegments);
+    // Merge segments
+    const merged = mergeSegments(transcribedSegments, translatedSegments);
     console.log(`[TRANSCRIBE] Merged: ${merged.length} segments`);
 
     return merged;
@@ -113,34 +127,34 @@ function parseSegments(response) {
 
 /**
  * Merge romanized and english segments
- * Uses romanized timing, pairs with closest english segment
+ * If transcription is non-Latin (Devanagari/Urdu), use translation for romanized
  */
-function mergeSegments(romanized, english) {
-  if (romanized.length === 0) return [];
+function mergeSegments(transcribed, translated) {
+  // Use translated segments as base for timing
+  const base = translated.length > 0 ? translated : transcribed;
+  if (base.length === 0) return [];
 
-  // If same count, pair directly by index
-  if (romanized.length === english.length) {
-    return romanized.map((seg, idx) => ({
-      id: idx,
-      start: seg.start,
-      end: seg.end,
-      romanized: seg.text,
-      english: english[idx].text,
-      // Keep 'text' for backward compatibility
-      text: english[idx].text
-    }));
-  }
+  return base.map((seg, idx) => {
+    // Get corresponding transcribed segment
+    const transcribedSeg = transcribed.length === base.length
+      ? transcribed[idx]
+      : findClosestSegment(seg.start, transcribed);
 
-  // Different counts - match by closest timestamp
-  return romanized.map((seg, idx) => {
-    const englishMatch = findClosestSegment(seg.start, english);
+    const transcribedText = transcribedSeg ? transcribedSeg.text : '';
+    const translatedText = seg.text;
+
+    // If transcription is non-Latin script, use translation as romanized
+    const romanized = isLatinScript(transcribedText)
+      ? transcribedText
+      : translatedText;
+
     return {
       id: idx,
       start: seg.start,
       end: seg.end,
-      romanized: seg.text,
-      english: englishMatch ? englishMatch.text : seg.text,
-      text: englishMatch ? englishMatch.text : seg.text
+      romanized: romanized,
+      english: translatedText,
+      text: translatedText
     };
   });
 }

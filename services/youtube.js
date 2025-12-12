@@ -7,6 +7,7 @@
 const { exec, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const util = require('util');
 
 const execPromise = util.promisify(exec);
@@ -14,14 +15,32 @@ const execPromise = util.promisify(exec);
 // Temp directory for audio files
 const TEMP_DIR = path.join(__dirname, '..', 'temp');
 
+// Local bin directory for yt-dlp
+const LOCAL_BIN = path.join(__dirname, '..', 'bin', 'yt-dlp');
+
+/**
+ * Get the yt-dlp command path - prefers local bin, falls back to system PATH
+ */
+function getYtDlpPath() {
+  // Check if local binary exists
+  if (fsSync.existsSync(LOCAL_BIN)) {
+    console.log('[YOUTUBE] Using local yt-dlp:', LOCAL_BIN);
+    return LOCAL_BIN;
+  }
+  // Fall back to system PATH
+  console.log('[YOUTUBE] Using system yt-dlp');
+  return 'yt-dlp';
+}
+
 /**
  * Check if yt-dlp is installed on the system
  * @returns {Promise<boolean>} True if yt-dlp is installed
  */
 async function checkYtDlpInstalled() {
+  const ytdlp = getYtDlpPath();
   try {
-    await execPromise('yt-dlp --version');
-    console.log('[YOUTUBE] yt-dlp is installed');
+    const { stdout } = await execPromise(`"${ytdlp}" --version`);
+    console.log(`[YOUTUBE] yt-dlp is installed, version: ${stdout.trim()}`);
     return true;
   } catch (error) {
     console.error('[YOUTUBE] yt-dlp is not installed:', error.message);
@@ -35,11 +54,12 @@ async function checkYtDlpInstalled() {
  * @returns {Promise<number>} Duration in seconds
  */
 async function getVideoDuration(youtubeUrl) {
+  const ytdlp = getYtDlpPath();
   try {
     console.log('[YOUTUBE] Getting video duration...');
 
     const { stdout } = await execPromise(
-      `yt-dlp --get-duration "${youtubeUrl}"`,
+      `"${ytdlp}" --get-duration "${youtubeUrl}"`,
       { timeout: 30000 }
     );
 
@@ -91,6 +111,8 @@ async function getVideoDuration(youtubeUrl) {
  * @returns {Promise<string>} Path to the downloaded audio file
  */
 async function downloadAudio(youtubeUrl, jobId) {
+  const ytdlp = getYtDlpPath();
+
   // Ensure temp directory exists
   try {
     await fs.mkdir(TEMP_DIR, { recursive: true });
@@ -116,9 +138,9 @@ async function downloadAudio(youtubeUrl, jobId) {
       youtubeUrl
     ];
 
-    console.log(`[YOUTUBE] Running: yt-dlp ${args.join(' ')}`);
+    console.log(`[YOUTUBE] Running: ${ytdlp} ${args.join(' ')}`);
 
-    const ytProcess = spawn('yt-dlp', args);
+    const ytProcess = spawn(ytdlp, args);
 
     let stdout = '';
     let stderr = '';
@@ -223,11 +245,12 @@ async function cleanupAudioFile(filePath) {
  * @returns {Promise<{title: string, channel: string, description: string}>}
  */
 async function getVideoMetadata(youtubeUrl) {
+  const ytdlp = getYtDlpPath();
   try {
     console.log('[YOUTUBE] Getting video metadata...');
 
     const { stdout } = await execPromise(
-      `yt-dlp --dump-json --no-download "${youtubeUrl}"`,
+      `"${ytdlp}" --dump-json --no-download "${youtubeUrl}"`,
       { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
     );
 

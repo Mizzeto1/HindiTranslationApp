@@ -79,7 +79,7 @@ app.get('/', (req, res) => {
     description: 'Translates Hindi, Punjabi, and 50+ languages to English',
     features: [
       'Clerk authentication',
-      'Freemium model (15 min/month free, 15 hrs/month premium)',
+      'Freemium model (30 min/month free, 15 hrs/month premium)',
       'Stripe subscription management'
     ],
     endpoints: {

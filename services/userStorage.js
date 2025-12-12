@@ -12,7 +12,7 @@ const path = require('path');
 const USERS_FILE = path.join(__dirname, '..', 'data', 'users.json');
 
 // Usage limits
-const FREE_LIMIT_MINUTES = 15;
+const FREE_LIMIT_MINUTES = 30;
 const PREMIUM_LIMIT_MINUTES = 900; // 15 hours
 
 /**

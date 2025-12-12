@@ -12,6 +12,7 @@ const { v4: uuidv4 } = require('uuid');
 const jobManager = require('../services/jobManager');
 const youtubeService = require('../services/youtube');
 const transcribeService = require('../services/transcribe');
+const lyricsService = require('../services/lyrics');
 const userStorage = require('../services/userStorage');
 const { requireAuth, getUserEmail } = require('../middleware/auth');
 const fs = require('fs').promises;
@@ -160,6 +161,10 @@ router.get('/status/:jobId', (req, res) => {
   if (job.status === 'complete') {
     response.transcript = job.transcript;
     response.duration = job.duration;
+    // Include transcription source (lyrics_db or groq_fallback)
+    if (job.transcription_source) {
+      response.transcription_source = job.transcription_source;
+    }
     // Include usage info if available
     if (job.minutes_used !== undefined) {
       response.minutes_used = job.minutes_used;
@@ -178,6 +183,7 @@ router.get('/status/:jobId', (req, res) => {
 
 /**
  * Process the translation job asynchronously
+ * Uses lyrics database first, falls back to Groq transcription
  * @param {string} jobId - The job ID
  * @param {string} youtubeUrl - The YouTube URL
  * @param {string} userId - The Clerk user ID
@@ -185,29 +191,53 @@ router.get('/status/:jobId', (req, res) => {
  */
 async function processTranslation(jobId, youtubeUrl, userId, duration) {
   let audioFilePath = null;
+  let transcriptionSource = 'groq_fallback'; // Default to Groq
 
   try {
-    // Step 1: Duration already checked, start downloading
-    console.log(`[JOB ${jobId}] Starting download for user: ${userId}`);
+    // Step 1: Get video metadata for lyrics search
+    console.log(`[JOB ${jobId}] Getting video metadata...`);
+    jobManager.updateJob(jobId, 'downloading', 10);
+
+    const metadata = await youtubeService.getVideoMetadata(youtubeUrl);
+    console.log(`[JOB ${jobId}] Video title: ${metadata.title}`);
+
+    // Step 2: Try to find lyrics first
+    console.log(`[JOB ${jobId}] Searching for lyrics...`);
     jobManager.updateJob(jobId, 'downloading', 20);
 
-    // Step 2: Download audio
-    console.log(`[JOB ${jobId}] Downloading audio...`);
-    jobManager.updateJob(jobId, 'downloading', 30);
+    let transcript = null;
+    const lyricsResult = await lyricsService.searchLyrics(metadata.title, duration);
 
-    audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
-    console.log(`[JOB ${jobId}] Audio downloaded to: ${audioFilePath}`);
-    jobManager.updateJob(jobId, 'downloading', 50);
+    if (lyricsResult.found) {
+      // Lyrics found! Use them instead of Groq
+      console.log(`[JOB ${jobId}] ✓ LYRICS FOUND (source: ${lyricsResult.source})`);
+      transcript = lyricsResult.segments;
+      transcriptionSource = `lyrics_db:${lyricsResult.source}`;
+      jobManager.updateJob(jobId, 'transcribing', 80);
+    } else {
+      // No lyrics found, fall back to Groq
+      console.log(`[JOB ${jobId}] No lyrics found, using Groq fallback...`);
 
-    // Step 3: Transcribe and translate
-    console.log(`[JOB ${jobId}] Starting transcription...`);
-    jobManager.updateJob(jobId, 'transcribing', 60);
+      // Step 3: Download audio (only if we need Groq)
+      console.log(`[JOB ${jobId}] Downloading audio...`);
+      jobManager.updateJob(jobId, 'downloading', 30);
 
-    const transcript = await transcribeService.transcribeAndTranslate(audioFilePath);
-    console.log(`[JOB ${jobId}] Transcription complete. Got ${transcript.length} segments.`);
+      audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
+      console.log(`[JOB ${jobId}] Audio downloaded to: ${audioFilePath}`);
+      jobManager.updateJob(jobId, 'downloading', 50);
+
+      // Step 4: Transcribe and translate with Groq
+      console.log(`[JOB ${jobId}] Starting Groq transcription...`);
+      jobManager.updateJob(jobId, 'transcribing', 60);
+
+      transcript = await transcribeService.transcribeAndTranslate(audioFilePath);
+      transcriptionSource = 'groq_fallback';
+    }
+
+    console.log(`[JOB ${jobId}] Transcription complete. Got ${transcript.length} segments. Source: ${transcriptionSource}`);
     jobManager.updateJob(jobId, 'transcribing', 90);
 
-    // Step 4: Deduct minutes from user's usage AFTER successful translation
+    // Step 5: Deduct minutes from user's usage AFTER successful translation
     let usageInfo = { minutes_used: 0, minutes_remaining: 0 };
     if (userId) {
       try {
@@ -219,20 +249,21 @@ async function processTranslation(jobId, youtubeUrl, userId, duration) {
       }
     }
 
-    // Step 5: Mark as complete with usage info
+    // Step 6: Mark as complete with usage info and source
     const job = jobManager.getJob(jobId);
     jobManager.completeJob(jobId, transcript, duration);
-    // Add usage info to the completed job
+    // Add usage info and transcription source to the completed job
     job.minutes_used = usageInfo.minutes_used;
     job.minutes_remaining = usageInfo.minutes_remaining;
-    console.log(`[JOB ${jobId}] Job completed successfully!`);
+    job.transcription_source = transcriptionSource;
+    console.log(`[JOB ${jobId}] Job completed successfully! (source: ${transcriptionSource})`);
 
   } catch (error) {
     console.error(`[JOB ${jobId}] Error:`, error.message);
     jobManager.failJob(jobId, error.message);
 
   } finally {
-    // Clean up audio file
+    // Clean up audio file (if it was downloaded)
     if (audioFilePath) {
       try {
         await fs.unlink(audioFilePath);

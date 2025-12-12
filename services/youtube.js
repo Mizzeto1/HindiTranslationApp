@@ -183,9 +183,49 @@ async function cleanupAudioFile(filePath) {
   }
 }
 
+/**
+ * Get video metadata (title, channel, etc.)
+ * @param {string} youtubeUrl - The YouTube URL
+ * @returns {Promise<{title: string, channel: string, description: string}>}
+ */
+async function getVideoMetadata(youtubeUrl) {
+  try {
+    console.log('[YOUTUBE] Getting video metadata...');
+
+    const { stdout } = await execPromise(
+      `yt-dlp --dump-json --no-download "${youtubeUrl}"`,
+      { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
+    );
+
+    const metadata = JSON.parse(stdout);
+
+    const result = {
+      title: metadata.title || '',
+      channel: metadata.channel || metadata.uploader || '',
+      description: metadata.description || '',
+      tags: metadata.tags || []
+    };
+
+    console.log(`[YOUTUBE] Video title: ${result.title}`);
+    console.log(`[YOUTUBE] Channel: ${result.channel}`);
+
+    return result;
+
+  } catch (error) {
+    console.error('[YOUTUBE] Error getting metadata:', error.message);
+    return {
+      title: '',
+      channel: '',
+      description: '',
+      tags: []
+    };
+  }
+}
+
 module.exports = {
   checkYtDlpInstalled,
   getVideoDuration,
   downloadAudio,
-  cleanupAudioFile
+  cleanupAudioFile,
+  getVideoMetadata
 };

@@ -17,6 +17,7 @@ temp/
 # User data (subscription/usage tracking)
 data/
 users.json
+lyrics-cache.json
 
 # Logs
 logs/

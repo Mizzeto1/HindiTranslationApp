@@ -1,9 +1,8 @@
 /**
  * Transcribe Service
  *
- * Dual-track output:
- * - Romanized Hindi/Punjabi (for singing along)
- * - English translation (for understanding)
+ * Handles audio translation using Groq's Whisper API.
+ * Uses the translations endpoint to output English directly.
  */
 
 const Groq = require('groq-sdk');
@@ -14,25 +13,13 @@ const groq = new Groq({
 });
 
 /**
- * Check if text is Latin script (romanized)
- * Returns false for Devanagari, Arabic/Urdu, etc.
- */
-function isLatinScript(text) {
-  if (!text) return true;
-  // Allow Latin letters, numbers, punctuation, spaces
-  // Block non-Latin scripts (Devanagari, Arabic, etc.)
-  const nonLatinPattern = /[\u0900-\u097F\u0600-\u06FF\u0980-\u09FF\u0A00-\u0A7F]/;
-  return !nonLatinPattern.test(text);
-}
-
-/**
- * Transcribe and translate audio - returns both romanized and English
+ * Transcribe and translate audio to English
  * @param {string} audioFilePath - Path to the audio file
  * @param {Object} options - Optional settings
- * @returns {Promise<Array>} Segments with romanized + english text
+ * @returns {Promise<Array>} Array of transcript segments with timestamps
  */
 async function transcribeAndTranslate(audioFilePath, options = {}) {
-  console.log(`[TRANSCRIBE] Starting dual transcription: ${audioFilePath}`);
+  console.log(`[TRANSCRIBE] Starting transcription: ${audioFilePath}`);
 
   if (!process.env.GROQ_API_KEY) {
     throw new Error('GROQ_API_KEY is not configured');
@@ -47,41 +34,39 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
   }
 
   try {
-    console.log('[TRANSCRIBE] Calling Whisper API (transcription + translation in parallel)...');
+    console.log('[TRANSCRIBE] Calling Groq Whisper API...');
 
-    // Run both API calls in parallel
-    const [transcription, translation] = await Promise.all([
-      // Transcription - let Whisper auto-detect language (often outputs romanized)
-      groq.audio.transcriptions.create({
-        file: fs.createReadStream(audioFilePath),
-        model: 'whisper-large-v3',
-        response_format: 'verbose_json'
-      }),
-      // Translation - gets English
-      groq.audio.translations.create({
-        file: fs.createReadStream(audioFilePath),
-        model: 'whisper-large-v3',
-        response_format: 'verbose_json'
-      })
-    ]);
+    const transcription = await groq.audio.translations.create({
+      file: fs.createReadStream(audioFilePath),
+      model: 'whisper-large-v3',
+      response_format: 'verbose_json'
+    });
 
-    console.log('[TRANSCRIBE] Both API calls complete');
+    console.log('[TRANSCRIBE] API response received');
 
-    // Parse segments from both responses
-    const transcribedSegments = parseSegments(transcription);
-    const translatedSegments = parseSegments(translation);
+    // Parse segments
+    let segments = [];
 
-    // Check if transcription is Latin script
-    const sampleText = transcribedSegments[0]?.text || '';
-    const isLatin = isLatinScript(sampleText);
-    console.log(`[TRANSCRIBE] Transcription: ${transcribedSegments.length} segments, Latin script: ${isLatin}`);
-    console.log(`[TRANSCRIBE] Translation: ${translatedSegments.length} segments`);
+    if (transcription.segments && Array.isArray(transcription.segments)) {
+      segments = transcription.segments.map((seg, idx) => ({
+        id: idx,
+        start: seg.start || 0,
+        end: seg.end || 0,
+        text: (seg.text || '').trim()
+      }));
+    } else if (transcription.text) {
+      segments = [{
+        id: 0,
+        start: 0,
+        end: transcription.duration || 0,
+        text: transcription.text.trim()
+      }];
+    }
 
-    // Merge segments
-    const merged = mergeSegments(transcribedSegments, translatedSegments);
-    console.log(`[TRANSCRIBE] Merged: ${merged.length} segments`);
+    segments = segments.filter(seg => seg.text.length > 0);
+    console.log(`[TRANSCRIBE] Got ${segments.length} segments`);
 
-    return merged;
+    return segments;
 
   } catch (error) {
     console.error('[TRANSCRIBE] Groq API error:', error);
@@ -96,120 +81,6 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
       throw new Error(`Transcription failed: ${error.message || 'Unknown error'}`);
     }
   }
-}
-
-/**
- * Parse segments from Whisper response
- */
-function parseSegments(response) {
-  if (response.segments && Array.isArray(response.segments)) {
-    return response.segments
-      .map((seg, idx) => ({
-        id: idx,
-        start: seg.start || 0,
-        end: seg.end || 0,
-        text: (seg.text || '').trim()
-      }))
-      .filter(seg => seg.text.length > 0);
-  }
-
-  if (response.text) {
-    return [{
-      id: 0,
-      start: 0,
-      end: response.duration || 0,
-      text: response.text.trim()
-    }];
-  }
-
-  return [];
-}
-
-/**
- * Normalize text for comparison (remove punctuation, extra spaces, lowercase)
- */
-function normalizeForComparison(text) {
-  if (!text) return '';
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, '')  // Remove punctuation
-    .replace(/\s+/g, ' ')      // Normalize spaces
-    .trim();
-}
-
-/**
- * Check if two texts are essentially the same (for duplicate detection)
- */
-function isSameText(text1, text2) {
-  const norm1 = normalizeForComparison(text1);
-  const norm2 = normalizeForComparison(text2);
-
-  if (norm1 === norm2) return true;
-
-  // Also check if one contains most of the other (handles slight differences)
-  if (norm1.length > 10 && norm2.length > 10) {
-    const shorter = norm1.length < norm2.length ? norm1 : norm2;
-    const longer = norm1.length < norm2.length ? norm2 : norm1;
-    if (longer.includes(shorter)) return true;
-  }
-
-  return false;
-}
-
-/**
- * Merge romanized and english segments
- * - If transcription is non-Latin (Devanagari/Urdu), use translation for romanized
- * - If romanized equals english, set romanized to null (avoid duplicates)
- */
-function mergeSegments(transcribed, translated) {
-  const base = translated.length > 0 ? translated : transcribed;
-  if (base.length === 0) return [];
-
-  return base.map((seg, idx) => {
-    const transcribedSeg = transcribed.length === base.length
-      ? transcribed[idx]
-      : findClosestSegment(seg.start, transcribed);
-
-    const transcribedText = transcribedSeg ? transcribedSeg.text : '';
-    const translatedText = seg.text;
-
-    // Get romanized text (use translation if transcription is non-Latin)
-    let romanized = isLatinScript(transcribedText) ? transcribedText : translatedText;
-
-    // If romanized is same as english, set to null (no point showing twice)
-    if (isSameText(romanized, translatedText)) {
-      romanized = null;
-    }
-
-    return {
-      id: idx,
-      start: seg.start,
-      end: seg.end,
-      romanized: romanized,
-      english: translatedText,
-      text: translatedText
-    };
-  });
-}
-
-/**
- * Find segment with closest start time
- */
-function findClosestSegment(targetTime, segments) {
-  if (segments.length === 0) return null;
-
-  let closest = segments[0];
-  let minDiff = Math.abs(segments[0].start - targetTime);
-
-  for (const seg of segments) {
-    const diff = Math.abs(seg.start - targetTime);
-    if (diff < minDiff) {
-      minDiff = diff;
-      closest = seg;
-    }
-  }
-
-  return closest;
 }
 
 /**

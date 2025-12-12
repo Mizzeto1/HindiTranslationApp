@@ -19,8 +19,9 @@ let pool = null;
 if (USE_POSTGRES) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+    ssl: { rejectUnauthorized: false }  // Required for Railway PostgreSQL
   });
+  console.log('[USER_STORAGE] PostgreSQL configured');
 }
 
 // In-memory fallback storage (data lost on restart)

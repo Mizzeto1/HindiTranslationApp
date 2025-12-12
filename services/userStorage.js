@@ -2,7 +2,7 @@
  * User Storage Service
  *
  * Handles user data persistence using PostgreSQL.
- * Tracks usage minutes, subscription status, and Stripe information.
+ * Falls back to in-memory storage if DATABASE_URL is not set.
  */
 
 const { Pool } = require('pg');
@@ -11,16 +11,30 @@ const { Pool } = require('pg');
 const FREE_LIMIT_MINUTES = 30;
 const PREMIUM_LIMIT_MINUTES = 900; // 15 hours
 
-// PostgreSQL connection pool
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// Check if PostgreSQL is configured
+const USE_POSTGRES = !!process.env.DATABASE_URL;
+
+// PostgreSQL connection pool (only if configured)
+let pool = null;
+if (USE_POSTGRES) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+  });
+}
+
+// In-memory fallback storage (data lost on restart)
+const memoryStorage = {};
 
 /**
- * Initialize the database table
+ * Initialize the database table (PostgreSQL only)
  */
 async function initDatabase() {
+  if (!USE_POSTGRES) {
+    console.log('[USER_STORAGE] No DATABASE_URL - using in-memory storage (data will reset on restart)');
+    return;
+  }
+
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -34,7 +48,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('[USER_STORAGE] Database initialized');
+    console.log('[USER_STORAGE] PostgreSQL database initialized');
   } catch (error) {
     console.error('[USER_STORAGE] Database init error:', error.message);
   }
@@ -53,17 +67,14 @@ function getNextResetDate() {
 }
 
 /**
- * Check if reset is needed and return updated minutes
+ * Check if reset is needed
  */
 function checkAndResetIfNeeded(user) {
   const now = new Date();
   const resetDate = new Date(user.reset_date);
 
   if (now >= resetDate) {
-    return {
-      needsReset: true,
-      newResetDate: getNextResetDate()
-    };
+    return { needsReset: true, newResetDate: getNextResetDate() };
   }
   return { needsReset: false };
 }
@@ -72,18 +83,20 @@ function checkAndResetIfNeeded(user) {
  * Get or create a user record
  */
 async function getOrCreateUser(userId, email = null) {
+  if (USE_POSTGRES) {
+    return getOrCreateUserPostgres(userId, email);
+  }
+  return getOrCreateUserMemory(userId, email);
+}
+
+async function getOrCreateUserPostgres(userId, email) {
   try {
-    // Try to get existing user
-    const result = await pool.query(
-      'SELECT * FROM users WHERE user_id = $1',
-      [userId]
-    );
+    const result = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
 
     if (result.rows.length > 0) {
       const user = result.rows[0];
-
-      // Check if reset is needed
       const resetCheck = checkAndResetIfNeeded(user);
+
       if (resetCheck.needsReset) {
         await pool.query(
           'UPDATE users SET minutes_used = 0, reset_date = $1 WHERE user_id = $2',
@@ -91,15 +104,10 @@ async function getOrCreateUser(userId, email = null) {
         );
         user.minutes_used = 0;
         user.reset_date = resetCheck.newResetDate;
-        console.log(`[USER_STORAGE] Reset usage for user ${userId}`);
       }
 
-      // Update email if needed
       if (email && user.email !== email) {
-        await pool.query(
-          'UPDATE users SET email = $1 WHERE user_id = $2',
-          [email, userId]
-        );
+        await pool.query('UPDATE users SET email = $1 WHERE user_id = $2', [email, userId]);
         user.email = email;
       }
 
@@ -125,100 +133,115 @@ async function getOrCreateUser(userId, email = null) {
 
     console.log(`[USER_STORAGE] Created new user: ${userId}`);
     return newUser;
-
   } catch (error) {
-    console.error('[USER_STORAGE] Error in getOrCreateUser:', error.message);
+    console.error('[USER_STORAGE] PostgreSQL error:', error.message);
     throw error;
   }
+}
+
+function getOrCreateUserMemory(userId, email) {
+  if (!memoryStorage[userId]) {
+    memoryStorage[userId] = {
+      user_id: userId,
+      email: email,
+      minutes_used: 0,
+      subscription_status: 'free',
+      stripe_customer_id: null,
+      stripe_subscription_id: null,
+      reset_date: getNextResetDate()
+    };
+    console.log(`[USER_STORAGE] Created new user (memory): ${userId}`);
+  } else {
+    const user = memoryStorage[userId];
+    const resetCheck = checkAndResetIfNeeded(user);
+    if (resetCheck.needsReset) {
+      user.minutes_used = 0;
+      user.reset_date = resetCheck.newResetDate;
+    }
+    if (email) user.email = email;
+  }
+  return memoryStorage[userId];
 }
 
 /**
  * Get user data by ID
  */
 async function getUser(userId) {
-  try {
-    const result = await pool.query(
-      'SELECT * FROM users WHERE user_id = $1',
-      [userId]
-    );
-
-    if (result.rows.length > 0) {
-      const user = result.rows[0];
-
-      // Check if reset is needed
-      const resetCheck = checkAndResetIfNeeded(user);
-      if (resetCheck.needsReset) {
-        await pool.query(
-          'UPDATE users SET minutes_used = 0, reset_date = $1 WHERE user_id = $2',
-          [resetCheck.newResetDate, userId]
-        );
-        user.minutes_used = 0;
-        user.reset_date = resetCheck.newResetDate;
+  if (USE_POSTGRES) {
+    try {
+      const result = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+      if (result.rows.length > 0) {
+        const user = result.rows[0];
+        const resetCheck = checkAndResetIfNeeded(user);
+        if (resetCheck.needsReset) {
+          await pool.query(
+            'UPDATE users SET minutes_used = 0, reset_date = $1 WHERE user_id = $2',
+            [resetCheck.newResetDate, userId]
+          );
+          user.minutes_used = 0;
+          user.reset_date = resetCheck.newResetDate;
+        }
+        return user;
       }
-
-      return user;
+      return null;
+    } catch (error) {
+      console.error('[USER_STORAGE] Error:', error.message);
+      return null;
     }
-
-    return null;
-  } catch (error) {
-    console.error('[USER_STORAGE] Error in getUser:', error.message);
-    return null;
   }
+  return memoryStorage[userId] || null;
 }
 
 /**
  * Update user data
  */
 async function updateUser(userId, updates) {
-  try {
+  if (USE_POSTGRES) {
     const fields = [];
     const values = [];
-    let paramIndex = 1;
-
+    let i = 1;
     for (const [key, value] of Object.entries(updates)) {
-      fields.push(`${key} = $${paramIndex}`);
+      fields.push(`${key} = $${i}`);
       values.push(value);
-      paramIndex++;
+      i++;
     }
-
     values.push(userId);
-
-    await pool.query(
-      `UPDATE users SET ${fields.join(', ')} WHERE user_id = $${paramIndex}`,
-      values
-    );
-
-    console.log(`[USER_STORAGE] Updated user ${userId}:`, Object.keys(updates));
-
+    await pool.query(`UPDATE users SET ${fields.join(', ')} WHERE user_id = $${i}`, values);
     return await getUser(userId);
-  } catch (error) {
-    console.error('[USER_STORAGE] Error in updateUser:', error.message);
-    throw error;
   }
+
+  if (memoryStorage[userId]) {
+    Object.assign(memoryStorage[userId], updates);
+  }
+  return memoryStorage[userId];
 }
 
 /**
  * Get user by Stripe customer ID
  */
 async function getUserByStripeCustomerId(stripeCustomerId) {
-  try {
-    const result = await pool.query(
-      'SELECT * FROM users WHERE stripe_customer_id = $1',
-      [stripeCustomerId]
-    );
-
-    if (result.rows.length > 0) {
-      return {
-        userId: result.rows[0].user_id,
-        userData: result.rows[0]
-      };
+  if (USE_POSTGRES) {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM users WHERE stripe_customer_id = $1',
+        [stripeCustomerId]
+      );
+      if (result.rows.length > 0) {
+        return { userId: result.rows[0].user_id, userData: result.rows[0] };
+      }
+      return null;
+    } catch (error) {
+      console.error('[USER_STORAGE] Error:', error.message);
+      return null;
     }
-
-    return null;
-  } catch (error) {
-    console.error('[USER_STORAGE] Error in getUserByStripeCustomerId:', error.message);
-    return null;
   }
+
+  for (const [id, user] of Object.entries(memoryStorage)) {
+    if (user.stripe_customer_id === stripeCustomerId) {
+      return { userId: id, userData: user };
+    }
+  }
+  return null;
 }
 
 /**
@@ -226,9 +249,7 @@ async function getUserByStripeCustomerId(stripeCustomerId) {
  */
 async function getRemainingMinutes(userId) {
   const user = await getOrCreateUser(userId);
-  const limit = user.subscription_status === 'premium'
-    ? PREMIUM_LIMIT_MINUTES
-    : FREE_LIMIT_MINUTES;
+  const limit = user.subscription_status === 'premium' ? PREMIUM_LIMIT_MINUTES : FREE_LIMIT_MINUTES;
 
   return {
     remaining: Math.max(0, limit - user.minutes_used),
@@ -238,14 +259,12 @@ async function getRemainingMinutes(userId) {
 }
 
 /**
- * Check if user can translate a video of given duration
+ * Check if user can translate a video
  */
 async function checkUsageLimit(userId, durationSeconds) {
   const user = await getOrCreateUser(userId);
   const durationMinutes = Math.ceil(durationSeconds / 60);
-  const limit = user.subscription_status === 'premium'
-    ? PREMIUM_LIMIT_MINUTES
-    : FREE_LIMIT_MINUTES;
+  const limit = user.subscription_status === 'premium' ? PREMIUM_LIMIT_MINUTES : FREE_LIMIT_MINUTES;
   const remaining = limit - user.minutes_used;
 
   if (remaining <= 0) {
@@ -255,7 +274,7 @@ async function checkUsageLimit(userId, durationSeconds) {
         error: 'limit_reached',
         message: 'You have reached your monthly limit',
         minutes_used: user.minutes_used,
-        limit: limit,
+        limit,
         subscription_status: user.subscription_status,
         reset_date: user.reset_date
       }
@@ -270,7 +289,7 @@ async function checkUsageLimit(userId, durationSeconds) {
         message: `Video is ${durationMinutes} minutes but you only have ${remaining} minutes remaining`,
         minutes_used: user.minutes_used,
         minutes_remaining: remaining,
-        limit: limit,
+        limit,
         video_duration_minutes: durationMinutes,
         subscription_status: user.subscription_status
       }
@@ -284,30 +303,27 @@ async function checkUsageLimit(userId, durationSeconds) {
  * Deduct minutes from user's usage
  */
 async function deductMinutes(userId, durationSeconds) {
-  try {
-    const durationMinutes = Math.ceil(durationSeconds / 60);
+  const durationMinutes = Math.ceil(durationSeconds / 60);
 
+  if (USE_POSTGRES) {
     await pool.query(
       'UPDATE users SET minutes_used = minutes_used + $1 WHERE user_id = $2',
       [durationMinutes, userId]
     );
-
-    const user = await getUser(userId);
-    const limit = user.subscription_status === 'premium'
-      ? PREMIUM_LIMIT_MINUTES
-      : FREE_LIMIT_MINUTES;
-
-    console.log(`[USER_STORAGE] Deducted ${durationMinutes} minutes from user ${userId}. Total: ${user.minutes_used}/${limit}`);
-
-    return {
-      minutes_used: user.minutes_used,
-      minutes_remaining: Math.max(0, limit - user.minutes_used),
-      limit: limit
-    };
-  } catch (error) {
-    console.error('[USER_STORAGE] Error in deductMinutes:', error.message);
-    throw error;
+  } else if (memoryStorage[userId]) {
+    memoryStorage[userId].minutes_used += durationMinutes;
   }
+
+  const user = await getUser(userId);
+  const limit = user.subscription_status === 'premium' ? PREMIUM_LIMIT_MINUTES : FREE_LIMIT_MINUTES;
+
+  console.log(`[USER_STORAGE] Deducted ${durationMinutes} min from ${userId}. Total: ${user.minutes_used}/${limit}`);
+
+  return {
+    minutes_used: user.minutes_used,
+    minutes_remaining: Math.max(0, limit - user.minutes_used),
+    limit
+  };
 }
 
 /**

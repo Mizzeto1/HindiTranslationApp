@@ -66,7 +66,20 @@ async function getVideoDuration(youtubeUrl) {
 
   } catch (error) {
     console.error('[YOUTUBE] Error getting duration:', error.message);
+    console.error('[YOUTUBE] Duration error details:', error.stderr || error.stack || '(no details)');
+
+    // Try to provide a more specific error message
+    const errorStr = String(error.message || error.stderr || '').toLowerCase();
+    if (errorStr.includes('unavailable') || errorStr.includes('private')) {
+      throw new Error('Video is unavailable or private');
+    } else if (errorStr.includes('age') || errorStr.includes('sign in')) {
+      throw new Error('Video is age-restricted');
+    } else if (errorStr.includes('not found') || errorStr.includes('404')) {
+      throw new Error('Video not found. Please check the URL.');
+    }
+
     // If we can't get duration, assume it's acceptable (will fail later if too long)
+    console.log('[YOUTUBE] Proceeding without duration check');
     return 0;
   }
 }
@@ -143,16 +156,37 @@ async function downloadAudio(youtubeUrl, jobId) {
       } else {
         console.error(`[YOUTUBE] yt-dlp failed with code ${code}`);
         console.error(`[YOUTUBE] stderr: ${stderr}`);
+        console.error(`[YOUTUBE] stdout: ${stdout}`);
 
-        // Parse common errors
-        if (stderr.includes('Video unavailable') || stderr.includes('Private video')) {
-          reject(new Error('Video is unavailable or private'));
-        } else if (stderr.includes('Sign in to confirm your age')) {
-          reject(new Error('Video is age-restricted'));
-        } else if (stderr.includes('copyright')) {
-          reject(new Error('Video is not available due to copyright restrictions'));
+        // Parse common errors with more specific messages
+        const stderrLower = stderr.toLowerCase();
+        const stdoutLower = stdout.toLowerCase();
+        const combined = stderrLower + stdoutLower;
+
+        if (combined.includes('video unavailable') || combined.includes('private video')) {
+          reject(new Error('Video is unavailable or private. Please check the URL.'));
+        } else if (combined.includes('sign in to confirm your age') || combined.includes('age-restricted')) {
+          reject(new Error('Video is age-restricted and cannot be downloaded.'));
+        } else if (combined.includes('copyright') || combined.includes('blocked')) {
+          reject(new Error('Video is blocked due to copyright restrictions.'));
+        } else if (combined.includes('premiere') || combined.includes('upcoming')) {
+          reject(new Error('Video is an upcoming premiere and not yet available.'));
+        } else if (combined.includes('members only') || combined.includes('member-only')) {
+          reject(new Error('Video is for channel members only.'));
+        } else if (combined.includes('geo restriction') || combined.includes('not available in your country')) {
+          reject(new Error('Video is not available in this region.'));
+        } else if (combined.includes('removed') || combined.includes('deleted')) {
+          reject(new Error('Video has been removed or deleted.'));
+        } else if (combined.includes('network') || combined.includes('connection')) {
+          reject(new Error('Network error while downloading video. Please try again.'));
+        } else if (combined.includes('http error 403') || combined.includes('forbidden')) {
+          reject(new Error('Access to video is forbidden. It may be private or region-locked.'));
+        } else if (combined.includes('http error 404') || combined.includes('not found')) {
+          reject(new Error('Video not found. Please check the URL.'));
         } else {
-          reject(new Error(`Failed to download audio: ${stderr || 'Unknown error'}`));
+          // Include first 200 chars of error for debugging
+          const errorSnippet = stderr.slice(0, 200) || 'Unknown error';
+          reject(new Error(`Failed to download: ${errorSnippet}`));
         }
       }
     });

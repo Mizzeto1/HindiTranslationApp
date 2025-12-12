@@ -266,21 +266,33 @@ router.get('/status/:jobId', (req, res) => {
 async function processTranslation(jobId, youtubeUrl, userId, duration) {
   let audioFilePath = null;
   let transcriptionSource = 'groq_fallback'; // Default to Groq
+  let currentStep = 'initializing';
 
   try {
     // Step 1: Get video metadata for lyrics search
-    console.log(`[JOB ${jobId}] Getting video metadata...`);
+    currentStep = 'getting_metadata';
+    console.log(`[JOB ${jobId}] Step: ${currentStep} - Getting video metadata...`);
     jobManager.updateJob(jobId, 'downloading', 10);
 
     const metadata = await youtubeService.getVideoMetadata(youtubeUrl);
-    console.log(`[JOB ${jobId}] Video title: ${metadata.title}`);
+    if (!metadata.title) {
+      console.log(`[JOB ${jobId}] Warning: Could not get video title`);
+    }
+    console.log(`[JOB ${jobId}] Video title: ${metadata.title || '(unknown)'}`);
 
     // Step 2: Try to find lyrics first
-    console.log(`[JOB ${jobId}] Searching for lyrics...`);
+    currentStep = 'searching_lyrics';
+    console.log(`[JOB ${jobId}] Step: ${currentStep} - Searching for lyrics...`);
     jobManager.updateJob(jobId, 'downloading', 20);
 
     let transcript = null;
-    const lyricsResult = await lyricsService.searchLyrics(metadata.title, duration);
+    let lyricsResult = { found: false };
+
+    try {
+      lyricsResult = await lyricsService.searchLyrics(metadata.title || '', duration);
+    } catch (lyricsError) {
+      console.log(`[JOB ${jobId}] Lyrics search error (non-fatal): ${lyricsError.message}`);
+    }
 
     if (lyricsResult.found) {
       // Lyrics found! Use them instead of Groq
@@ -293,20 +305,32 @@ async function processTranslation(jobId, youtubeUrl, userId, duration) {
       console.log(`[JOB ${jobId}] No lyrics found, using Groq fallback...`);
 
       // Step 3: Download audio (only if we need Groq)
-      console.log(`[JOB ${jobId}] Downloading audio...`);
+      currentStep = 'downloading_audio';
+      console.log(`[JOB ${jobId}] Step: ${currentStep} - Downloading audio from YouTube...`);
       jobManager.updateJob(jobId, 'downloading', 30);
 
-      audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
-      console.log(`[JOB ${jobId}] Audio downloaded to: ${audioFilePath}`);
+      try {
+        audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
+        console.log(`[JOB ${jobId}] Audio downloaded to: ${audioFilePath}`);
+      } catch (downloadError) {
+        console.error(`[JOB ${jobId}] Audio download failed: ${downloadError.message}`);
+        throw new Error(`Failed to download audio: ${downloadError.message}`);
+      }
       jobManager.updateJob(jobId, 'downloading', 50);
 
       // Step 4: Transcribe and translate with Groq
-      console.log(`[JOB ${jobId}] Starting Groq transcription...`);
+      currentStep = 'transcribing';
+      console.log(`[JOB ${jobId}] Step: ${currentStep} - Starting Groq transcription...`);
       jobManager.updateJob(jobId, 'transcribing', 60);
 
-      transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
-        videoTitle: metadata.title
-      });
+      try {
+        transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
+          videoTitle: metadata.title
+        });
+      } catch (transcribeError) {
+        console.error(`[JOB ${jobId}] Transcription failed: ${transcribeError.message}`);
+        throw new Error(`Failed to transcribe audio: ${transcribeError.message}`);
+      }
       transcriptionSource = 'groq_fallback';
     }
 
@@ -335,8 +359,10 @@ async function processTranslation(jobId, youtubeUrl, userId, duration) {
     console.log(`[JOB ${jobId}] Job completed successfully! (source: ${transcriptionSource})`);
 
   } catch (error) {
-    console.error(`[JOB ${jobId}] Error:`, error.message);
-    jobManager.failJob(jobId, error.message);
+    const errorDetail = `[Step: ${currentStep}] ${error.message}`;
+    console.error(`[JOB ${jobId}] Error at step '${currentStep}':`, error.message);
+    console.error(`[JOB ${jobId}] Full error:`, error.stack || error);
+    jobManager.failJob(jobId, errorDetail);
 
   } finally {
     // Clean up audio file (if it was downloaded)

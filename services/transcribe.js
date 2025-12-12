@@ -51,11 +51,10 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
 
     // Run both API calls in parallel
     const [transcription, translation] = await Promise.all([
-      // Transcription - force Hindi to get romanized/Devanagari output
+      // Transcription - let Whisper auto-detect language (often outputs romanized)
       groq.audio.transcriptions.create({
         file: fs.createReadStream(audioFilePath),
         model: 'whisper-large-v3',
-        language: 'hi',  // Force Hindi detection to avoid auto-translating
         response_format: 'verbose_json'
       }),
       // Translation - gets English

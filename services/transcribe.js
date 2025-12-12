@@ -127,6 +127,37 @@ function parseSegments(response) {
 }
 
 /**
+ * Normalize text for comparison (remove punctuation, extra spaces, lowercase)
+ */
+function normalizeForComparison(text) {
+  if (!text) return '';
+  return text
+    .toLowerCase()
+    .replace(/[^\w\s]/g, '')  // Remove punctuation
+    .replace(/\s+/g, ' ')      // Normalize spaces
+    .trim();
+}
+
+/**
+ * Check if two texts are essentially the same (for duplicate detection)
+ */
+function isSameText(text1, text2) {
+  const norm1 = normalizeForComparison(text1);
+  const norm2 = normalizeForComparison(text2);
+
+  if (norm1 === norm2) return true;
+
+  // Also check if one contains most of the other (handles slight differences)
+  if (norm1.length > 10 && norm2.length > 10) {
+    const shorter = norm1.length < norm2.length ? norm1 : norm2;
+    const longer = norm1.length < norm2.length ? norm2 : norm1;
+    if (longer.includes(shorter)) return true;
+  }
+
+  return false;
+}
+
+/**
  * Merge romanized and english segments
  * - If transcription is non-Latin (Devanagari/Urdu), use translation for romanized
  * - If romanized equals english, set romanized to null (avoid duplicates)
@@ -147,7 +178,7 @@ function mergeSegments(transcribed, translated) {
     let romanized = isLatinScript(transcribedText) ? transcribedText : translatedText;
 
     // If romanized is same as english, set to null (no point showing twice)
-    if (romanized.toLowerCase().trim() === translatedText.toLowerCase().trim()) {
+    if (isSameText(romanized, translatedText)) {
       romanized = null;
     }
 

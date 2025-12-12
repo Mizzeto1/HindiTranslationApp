@@ -7,7 +7,7 @@
  * Optimized for Hindi/Punjabi Bollywood song lyrics with:
  * - Context prompt for better accuracy
  * - Low temperature for consistent output
- * - Turbo model for speed + quality balance
+ * - whisper-large-v3 model (turbo doesn't support translation)
  */
 
 const Groq = require('groq-sdk');
@@ -65,7 +65,7 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
     // - response_format: verbose_json for timestamps
     const transcription = await groq.audio.translations.create({
       file: fs.createReadStream(audioFilePath),
-      model: 'whisper-large-v3-turbo',  // Turbo is faster and great for songs
+      model: 'whisper-large-v3',  // Full model required for translation (turbo doesn't support it)
       response_format: 'verbose_json',
       prompt: prompt,
       temperature: 0  // More deterministic = more accurate

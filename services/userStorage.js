@@ -1,73 +1,50 @@
 /**
  * User Storage Service
  *
- * Handles user data persistence in a JSON file.
+ * Handles user data persistence using PostgreSQL.
  * Tracks usage minutes, subscription status, and Stripe information.
  */
 
-const fs = require('fs').promises;
-const path = require('path');
-
-// Path to users.json file
-const USERS_FILE = path.join(__dirname, '..', 'data', 'users.json');
+const { Pool } = require('pg');
 
 // Usage limits
 const FREE_LIMIT_MINUTES = 30;
 const PREMIUM_LIMIT_MINUTES = 900; // 15 hours
 
-/**
- * Ensure the data directory and users.json file exist
- */
-async function ensureDataFile() {
-  const dataDir = path.dirname(USERS_FILE);
-
-  try {
-    await fs.access(dataDir);
-  } catch {
-    await fs.mkdir(dataDir, { recursive: true });
-    console.log('[USER_STORAGE] Created data directory');
-  }
-
-  try {
-    await fs.access(USERS_FILE);
-  } catch {
-    await fs.writeFile(USERS_FILE, JSON.stringify({}, null, 2));
-    console.log('[USER_STORAGE] Created users.json file');
-  }
-}
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 /**
- * Load all users from the JSON file
- * @returns {Promise<Object>} - The users object
+ * Initialize the database table
  */
-async function loadUsers() {
-  await ensureDataFile();
+async function initDatabase() {
   try {
-    const data = await fs.readFile(USERS_FILE, 'utf8');
-    return JSON.parse(data);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        user_id VARCHAR(255) PRIMARY KEY,
+        email VARCHAR(255),
+        minutes_used INTEGER DEFAULT 0,
+        subscription_status VARCHAR(50) DEFAULT 'free',
+        stripe_customer_id VARCHAR(255),
+        stripe_subscription_id VARCHAR(255),
+        reset_date DATE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('[USER_STORAGE] Database initialized');
   } catch (error) {
-    console.error('[USER_STORAGE] Error loading users:', error.message);
-    return {};
+    console.error('[USER_STORAGE] Database init error:', error.message);
   }
 }
 
-/**
- * Save all users to the JSON file
- * @param {Object} users - The users object to save
- */
-async function saveUsers(users) {
-  await ensureDataFile();
-  try {
-    await fs.writeFile(USERS_FILE, JSON.stringify(users, null, 2));
-  } catch (error) {
-    console.error('[USER_STORAGE] Error saving users:', error.message);
-    throw error;
-  }
-}
+// Initialize on startup
+initDatabase();
 
 /**
  * Get the reset date for the current month (1st of next month)
- * @returns {string} - ISO date string for the 1st of next month
  */
 function getNextResetDate() {
   const now = new Date();
@@ -76,119 +53,176 @@ function getNextResetDate() {
 }
 
 /**
- * Check if the reset date has passed and reset if needed
- * @param {Object} userData - The user data object
- * @returns {boolean} - Whether a reset was performed
+ * Check if reset is needed and return updated minutes
  */
-function checkAndResetIfNeeded(userData) {
+function checkAndResetIfNeeded(user) {
   const now = new Date();
-  const resetDate = new Date(userData.reset_date);
+  const resetDate = new Date(user.reset_date);
 
   if (now >= resetDate) {
-    userData.minutes_used = 0;
-    userData.reset_date = getNextResetDate();
-    console.log(`[USER_STORAGE] Reset usage for user. New reset date: ${userData.reset_date}`);
-    return true;
+    return {
+      needsReset: true,
+      newResetDate: getNextResetDate()
+    };
   }
-  return false;
+  return { needsReset: false };
 }
 
 /**
  * Get or create a user record
- * @param {string} userId - The Clerk user ID
- * @param {string} email - The user's email (optional)
- * @returns {Promise<Object>} - The user data
  */
 async function getOrCreateUser(userId, email = null) {
-  const users = await loadUsers();
+  try {
+    // Try to get existing user
+    const result = await pool.query(
+      'SELECT * FROM users WHERE user_id = $1',
+      [userId]
+    );
 
-  if (!users[userId]) {
-    users[userId] = {
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+
+      // Check if reset is needed
+      const resetCheck = checkAndResetIfNeeded(user);
+      if (resetCheck.needsReset) {
+        await pool.query(
+          'UPDATE users SET minutes_used = 0, reset_date = $1 WHERE user_id = $2',
+          [resetCheck.newResetDate, userId]
+        );
+        user.minutes_used = 0;
+        user.reset_date = resetCheck.newResetDate;
+        console.log(`[USER_STORAGE] Reset usage for user ${userId}`);
+      }
+
+      // Update email if needed
+      if (email && user.email !== email) {
+        await pool.query(
+          'UPDATE users SET email = $1 WHERE user_id = $2',
+          [email, userId]
+        );
+        user.email = email;
+      }
+
+      return user;
+    }
+
+    // Create new user
+    const newUser = {
+      user_id: userId,
       email: email,
       minutes_used: 0,
       subscription_status: 'free',
       stripe_customer_id: null,
       stripe_subscription_id: null,
-      reset_date: getNextResetDate(),
-      created_at: new Date().toISOString()
+      reset_date: getNextResetDate()
     };
-    await saveUsers(users);
-    console.log(`[USER_STORAGE] Created new user: ${userId}`);
-  } else {
-    // Check if we need to reset the monthly usage
-    if (checkAndResetIfNeeded(users[userId])) {
-      await saveUsers(users);
-    }
-    // Update email if provided and different
-    if (email && users[userId].email !== email) {
-      users[userId].email = email;
-      await saveUsers(users);
-    }
-  }
 
-  return users[userId];
+    await pool.query(
+      `INSERT INTO users (user_id, email, minutes_used, subscription_status, reset_date)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, email, 0, 'free', newUser.reset_date]
+    );
+
+    console.log(`[USER_STORAGE] Created new user: ${userId}`);
+    return newUser;
+
+  } catch (error) {
+    console.error('[USER_STORAGE] Error in getOrCreateUser:', error.message);
+    throw error;
+  }
 }
 
 /**
  * Get user data by ID
- * @param {string} userId - The Clerk user ID
- * @returns {Promise<Object|null>} - The user data or null if not found
  */
 async function getUser(userId) {
-  const users = await loadUsers();
-  const user = users[userId];
+  try {
+    const result = await pool.query(
+      'SELECT * FROM users WHERE user_id = $1',
+      [userId]
+    );
 
-  if (user) {
-    // Check if we need to reset the monthly usage
-    if (checkAndResetIfNeeded(user)) {
-      await saveUsers(users);
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+
+      // Check if reset is needed
+      const resetCheck = checkAndResetIfNeeded(user);
+      if (resetCheck.needsReset) {
+        await pool.query(
+          'UPDATE users SET minutes_used = 0, reset_date = $1 WHERE user_id = $2',
+          [resetCheck.newResetDate, userId]
+        );
+        user.minutes_used = 0;
+        user.reset_date = resetCheck.newResetDate;
+      }
+
+      return user;
     }
-  }
 
-  return user || null;
+    return null;
+  } catch (error) {
+    console.error('[USER_STORAGE] Error in getUser:', error.message);
+    return null;
+  }
 }
 
 /**
  * Update user data
- * @param {string} userId - The Clerk user ID
- * @param {Object} updates - The fields to update
- * @returns {Promise<Object>} - The updated user data
  */
 async function updateUser(userId, updates) {
-  const users = await loadUsers();
+  try {
+    const fields = [];
+    const values = [];
+    let paramIndex = 1;
 
-  if (!users[userId]) {
-    throw new Error(`User not found: ${userId}`);
+    for (const [key, value] of Object.entries(updates)) {
+      fields.push(`${key} = $${paramIndex}`);
+      values.push(value);
+      paramIndex++;
+    }
+
+    values.push(userId);
+
+    await pool.query(
+      `UPDATE users SET ${fields.join(', ')} WHERE user_id = $${paramIndex}`,
+      values
+    );
+
+    console.log(`[USER_STORAGE] Updated user ${userId}:`, Object.keys(updates));
+
+    return await getUser(userId);
+  } catch (error) {
+    console.error('[USER_STORAGE] Error in updateUser:', error.message);
+    throw error;
   }
-
-  users[userId] = { ...users[userId], ...updates };
-  await saveUsers(users);
-
-  console.log(`[USER_STORAGE] Updated user ${userId}:`, Object.keys(updates));
-  return users[userId];
 }
 
 /**
  * Get user by Stripe customer ID
- * @param {string} stripeCustomerId - The Stripe customer ID
- * @returns {Promise<{userId: string, userData: Object}|null>}
  */
 async function getUserByStripeCustomerId(stripeCustomerId) {
-  const users = await loadUsers();
+  try {
+    const result = await pool.query(
+      'SELECT * FROM users WHERE stripe_customer_id = $1',
+      [stripeCustomerId]
+    );
 
-  for (const [userId, userData] of Object.entries(users)) {
-    if (userData.stripe_customer_id === stripeCustomerId) {
-      return { userId, userData };
+    if (result.rows.length > 0) {
+      return {
+        userId: result.rows[0].user_id,
+        userData: result.rows[0]
+      };
     }
-  }
 
-  return null;
+    return null;
+  } catch (error) {
+    console.error('[USER_STORAGE] Error in getUserByStripeCustomerId:', error.message);
+    return null;
+  }
 }
 
 /**
- * Get the user's remaining minutes
- * @param {string} userId - The Clerk user ID
- * @returns {Promise<Object>} - Object with remaining, used, and limit
+ * Get remaining minutes for a user
  */
 async function getRemainingMinutes(userId) {
   const user = await getOrCreateUser(userId);
@@ -205,9 +239,6 @@ async function getRemainingMinutes(userId) {
 
 /**
  * Check if user can translate a video of given duration
- * @param {string} userId - The Clerk user ID
- * @param {number} durationSeconds - Video duration in seconds
- * @returns {Promise<{canTranslate: boolean, error?: Object}>}
  */
 async function checkUsageLimit(userId, durationSeconds) {
   const user = await getOrCreateUser(userId);
@@ -251,41 +282,36 @@ async function checkUsageLimit(userId, durationSeconds) {
 
 /**
  * Deduct minutes from user's usage
- * @param {string} userId - The Clerk user ID
- * @param {number} durationSeconds - Duration to deduct in seconds
- * @returns {Promise<Object>} - Updated usage info
  */
 async function deductMinutes(userId, durationSeconds) {
-  const users = await loadUsers();
-  const user = users[userId];
+  try {
+    const durationMinutes = Math.ceil(durationSeconds / 60);
 
-  if (!user) {
-    throw new Error(`User not found: ${userId}`);
+    await pool.query(
+      'UPDATE users SET minutes_used = minutes_used + $1 WHERE user_id = $2',
+      [durationMinutes, userId]
+    );
+
+    const user = await getUser(userId);
+    const limit = user.subscription_status === 'premium'
+      ? PREMIUM_LIMIT_MINUTES
+      : FREE_LIMIT_MINUTES;
+
+    console.log(`[USER_STORAGE] Deducted ${durationMinutes} minutes from user ${userId}. Total: ${user.minutes_used}/${limit}`);
+
+    return {
+      minutes_used: user.minutes_used,
+      minutes_remaining: Math.max(0, limit - user.minutes_used),
+      limit: limit
+    };
+  } catch (error) {
+    console.error('[USER_STORAGE] Error in deductMinutes:', error.message);
+    throw error;
   }
-
-  const durationMinutes = Math.ceil(durationSeconds / 60);
-  user.minutes_used += durationMinutes;
-
-  await saveUsers(users);
-
-  const limit = user.subscription_status === 'premium'
-    ? PREMIUM_LIMIT_MINUTES
-    : FREE_LIMIT_MINUTES;
-
-  console.log(`[USER_STORAGE] Deducted ${durationMinutes} minutes from user ${userId}. Total: ${user.minutes_used}/${limit}`);
-
-  return {
-    minutes_used: user.minutes_used,
-    minutes_remaining: Math.max(0, limit - user.minutes_used),
-    limit: limit
-  };
 }
 
 /**
  * Upgrade user to premium
- * @param {string} userId - The Clerk user ID
- * @param {string} stripeCustomerId - The Stripe customer ID
- * @param {string} stripeSubscriptionId - The Stripe subscription ID
  */
 async function upgradeToPremium(userId, stripeCustomerId, stripeSubscriptionId) {
   await updateUser(userId, {
@@ -298,7 +324,6 @@ async function upgradeToPremium(userId, stripeCustomerId, stripeSubscriptionId) 
 
 /**
  * Downgrade user to free
- * @param {string} userId - The Clerk user ID
  */
 async function downgradeToFree(userId) {
   await updateUser(userId, {

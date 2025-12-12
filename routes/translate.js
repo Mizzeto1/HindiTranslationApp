@@ -230,7 +230,9 @@ async function processTranslation(jobId, youtubeUrl, userId, duration) {
       console.log(`[JOB ${jobId}] Starting Groq transcription...`);
       jobManager.updateJob(jobId, 'transcribing', 60);
 
-      transcript = await transcribeService.transcribeAndTranslate(audioFilePath);
+      transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
+        videoTitle: metadata.title
+      });
       transcriptionSource = 'groq_fallback';
     }
 

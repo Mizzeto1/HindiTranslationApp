@@ -3,6 +3,11 @@
  *
  * Handles transcription and translation using Groq's Whisper API.
  * The translations endpoint automatically outputs English.
+ *
+ * Optimized for Hindi/Punjabi Bollywood song lyrics with:
+ * - Context prompt for better accuracy
+ * - Low temperature for consistent output
+ * - Turbo model for speed + quality balance
  */
 
 const Groq = require('groq-sdk');
@@ -13,12 +18,20 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY
 });
 
+// Prompt to help Whisper understand the context (improves accuracy significantly)
+const TRANSCRIPTION_PROMPT = `This is a Hindi or Punjabi song with lyrics.
+Common themes: love, heartbreak, celebration, devotion, Bollywood music.
+May include: Hindi words, Punjabi words, Urdu poetry, romantic expressions.
+Translate naturally to English, preserving the emotional meaning.`;
+
 /**
  * Transcribe and translate an audio file to English
  * @param {string} audioFilePath - Path to the audio file
+ * @param {Object} options - Optional settings
+ * @param {string} options.videoTitle - Video title for context
  * @returns {Promise<Array>} Array of transcript segments with timestamps
  */
-async function transcribeAndTranslate(audioFilePath) {
+async function transcribeAndTranslate(audioFilePath, options = {}) {
   console.log(`[TRANSCRIBE] Starting transcription of: ${audioFilePath}`);
 
   // Check if API key is configured
@@ -36,14 +49,26 @@ async function transcribeAndTranslate(audioFilePath) {
     throw new Error(`Audio file is too large (${fileSizeMB.toFixed(2)} MB). Maximum is 25 MB.`);
   }
 
+  // Build context prompt - include video title if available for better accuracy
+  let prompt = TRANSCRIPTION_PROMPT;
+  if (options.videoTitle) {
+    prompt = `Song: "${options.videoTitle}"\n${TRANSCRIPTION_PROMPT}`;
+  }
+
   try {
-    console.log('[TRANSCRIBE] Calling Groq API...');
+    console.log('[TRANSCRIBE] Calling Groq API with optimized settings...');
 
     // Use the translations endpoint for Hindi -> English
+    // Key improvements:
+    // - prompt: Provides context about the content (song lyrics)
+    // - temperature: 0 for most accurate/consistent output
+    // - response_format: verbose_json for timestamps
     const transcription = await groq.audio.translations.create({
       file: fs.createReadStream(audioFilePath),
-      model: 'whisper-large-v3',
-      response_format: 'verbose_json'
+      model: 'whisper-large-v3-turbo',  // Turbo is faster and great for songs
+      response_format: 'verbose_json',
+      prompt: prompt,
+      temperature: 0  // More deterministic = more accurate
     });
 
     console.log('[TRANSCRIBE] Groq API response received');
@@ -52,7 +77,11 @@ async function transcribeAndTranslate(audioFilePath) {
     const segments = parseTranscriptionResponse(transcription);
     console.log(`[TRANSCRIBE] Parsed ${segments.length} segments`);
 
-    return segments;
+    // Post-process segments for better quality
+    const cleanedSegments = postProcessSegments(segments);
+    console.log(`[TRANSCRIBE] Post-processed to ${cleanedSegments.length} segments`);
+
+    return cleanedSegments;
 
   } catch (error) {
     console.error('[TRANSCRIBE] Groq API error:', error);
@@ -104,6 +133,79 @@ function parseTranscriptionResponse(response) {
   // Empty response
   console.log('[TRANSCRIBE] Empty response from API');
   return [];
+}
+
+/**
+ * Post-process segments to improve quality
+ * - Remove empty segments
+ * - Clean up repeated text
+ * - Merge very short segments
+ * @param {Array} segments - Raw segments from API
+ * @returns {Array} Cleaned segments
+ */
+function postProcessSegments(segments) {
+  if (!segments || segments.length === 0) return [];
+
+  const cleaned = [];
+  let lastText = '';
+
+  for (const segment of segments) {
+    // Skip empty segments
+    if (!segment.text || segment.text.trim().length === 0) continue;
+
+    const text = segment.text.trim();
+
+    // Skip if it's just repeating the last segment exactly
+    if (text === lastText) continue;
+
+    // Clean up common transcription artifacts
+    let cleanedText = text
+      .replace(/\[.*?\]/g, '')  // Remove [Music], [Applause], etc.
+      .replace(/\(.*?\)/g, '')  // Remove (inaudible), etc.
+      .replace(/♪/g, '')        // Remove music notes
+      .replace(/\s+/g, ' ')     // Normalize whitespace
+      .trim();
+
+    // Skip if cleaned text is too short (likely noise)
+    if (cleanedText.length < 2) continue;
+
+    cleaned.push({
+      id: cleaned.length,
+      start: segment.start,
+      end: segment.end,
+      text: cleanedText
+    });
+
+    lastText = text;
+  }
+
+  // Merge very short consecutive segments (< 1 second) for better readability
+  const merged = [];
+  let buffer = null;
+
+  for (const segment of cleaned) {
+    const duration = segment.end - segment.start;
+
+    if (buffer === null) {
+      buffer = { ...segment };
+    } else if (duration < 1 && (segment.start - buffer.end) < 0.5) {
+      // Merge short segment into buffer
+      buffer.end = segment.end;
+      buffer.text = `${buffer.text} ${segment.text}`;
+    } else {
+      // Push buffer and start new one
+      merged.push(buffer);
+      buffer = { ...segment };
+    }
+  }
+
+  // Don't forget the last buffer
+  if (buffer) {
+    merged.push(buffer);
+  }
+
+  // Re-index
+  return merged.map((seg, idx) => ({ ...seg, id: idx }));
 }
 
 /**

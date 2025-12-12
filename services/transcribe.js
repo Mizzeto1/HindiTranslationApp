@@ -4,6 +4,10 @@
  * Handles transcription and translation using Groq's Whisper API.
  * The translations endpoint automatically outputs English.
  *
+ * Two-step translation process:
+ * 1. Whisper transcribes/translates audio
+ * 2. LLM translates any remaining romanized Hindi/Punjabi to English
+ *
  * Optimized for Hindi/Punjabi Bollywood song lyrics with:
  * - Context prompt for better accuracy
  * - Low temperature for consistent output
@@ -23,6 +27,150 @@ const TRANSCRIPTION_PROMPT = `This is a Hindi or Punjabi song with lyrics.
 Common themes: love, heartbreak, celebration, devotion, Bollywood music.
 May include: Hindi words, Punjabi words, Urdu poetry, romantic expressions.
 Translate naturally to English, preserving the emotional meaning.`;
+
+// Common romanized Hindi/Punjabi words that indicate text needs translation
+const ROMANIZED_INDICATORS = [
+  'meri', 'teri', 'tere', 'mere', 'mera', 'tera', 'pyar', 'pyaar', 'ishq', 'dil',
+  'tujhe', 'mujhe', 'tumhe', 'hum', 'tum', 'aap', 'main', 'tu', 'hai', 'hain',
+  'kya', 'kyu', 'kyun', 'kaun', 'kaise', 'kahan', 'jab', 'tab', 'ab', 'phir',
+  'aaja', 'jaana', 'rehna', 'milna', 'kehna', 'sunna', 'dekhna', 'samajh',
+  'zindagi', 'duniya', 'raat', 'din', 'subah', 'shaam', 'waqt', 'lamha',
+  'naina', 'aankhein', 'dard', 'gham', 'khushi', 'aashiq', 'deewana', 'pagal',
+  'sanam', 'jaana', 'soniye', 'kudiye', 'yaara', 'yaar', 'dost', 'bhai',
+  'nachle', 'gaana', 'dhol', 'bhangra', 'punjabi', 'hindi', 'bollywood',
+  'ho gaya', 'ho gayi', 'kar de', 'kar do', 'de de', 'le le', 'aa ja',
+  'nahi', 'nahin', 'koi', 'sab', 'bahut', 'bohot', 'accha', 'acha', 'theek'
+];
+
+/**
+ * Check if text appears to be romanized Hindi/Punjabi rather than English
+ * @param {string} text - Text to check
+ * @returns {boolean} True if text appears to need translation
+ */
+function needsLLMTranslation(text) {
+  if (!text || text.length < 10) return false;
+
+  const lowerText = text.toLowerCase();
+  const words = lowerText.split(/\s+/);
+
+  // Count how many romanized indicators are present
+  let indicatorCount = 0;
+  for (const indicator of ROMANIZED_INDICATORS) {
+    if (lowerText.includes(indicator)) {
+      indicatorCount++;
+    }
+  }
+
+  // If more than 3 indicators found, likely needs translation
+  if (indicatorCount >= 3) {
+    console.log(`[TRANSCRIBE] Detected ${indicatorCount} romanized words - will use LLM translation`);
+    return true;
+  }
+
+  // Check for patterns common in romanized text
+  // Like repeated 'aa', 'ee', 'oo' which are common in Hindi romanization
+  const romanizedPatterns = /\b\w*(aa|ee|oo|ii|uu)\w*\b/gi;
+  const patternMatches = (text.match(romanizedPatterns) || []).length;
+
+  if (patternMatches > words.length * 0.3) {
+    console.log(`[TRANSCRIBE] High romanization pattern density - will use LLM translation`);
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Translate romanized Hindi/Punjabi text to English using LLM
+ * @param {Array} segments - Array of transcript segments
+ * @returns {Promise<Array>} Translated segments
+ */
+async function translateWithLLM(segments) {
+  if (!segments || segments.length === 0) return segments;
+
+  // Combine all text for context
+  const fullText = segments.map(s => s.text).join('\n');
+
+  console.log('[TRANSCRIBE] Translating romanized text with LLM...');
+
+  try {
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a Hindi/Punjabi to English translator specializing in Bollywood and Punjabi song lyrics.
+
+Your task: Translate the romanized Hindi/Punjabi lyrics to natural, poetic English.
+
+Rules:
+1. Translate the MEANING, not word-for-word
+2. Keep the emotional tone and poetic feel
+3. Output ONLY the English translation, nothing else
+4. Preserve line breaks exactly as given
+5. If a line is already in English, keep it as-is
+6. Don't add explanations or notes`
+        },
+        {
+          role: 'user',
+          content: `Translate these song lyrics to English:\n\n${fullText}`
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 2000
+    });
+
+    const translatedText = response.choices[0]?.message?.content?.trim();
+
+    if (!translatedText) {
+      console.log('[TRANSCRIBE] LLM returned empty response, using original');
+      return segments;
+    }
+
+    console.log('[TRANSCRIBE] LLM translation complete');
+
+    // Split translated text back into segments, preserving timing
+    const translatedLines = translatedText.split('\n').filter(line => line.trim());
+
+    // Map translated lines back to segments
+    // If counts don't match, distribute evenly
+    if (translatedLines.length === segments.length) {
+      return segments.map((segment, i) => ({
+        ...segment,
+        text: translatedLines[i].trim()
+      }));
+    } else {
+      // Different line counts - try to merge intelligently
+      console.log(`[TRANSCRIBE] Line count mismatch: ${segments.length} segments, ${translatedLines.length} translated lines`);
+
+      // If we have fewer translated lines, combine adjacent segments
+      if (translatedLines.length < segments.length) {
+        const ratio = segments.length / translatedLines.length;
+        return translatedLines.map((line, i) => {
+          const startIdx = Math.floor(i * ratio);
+          const endIdx = Math.min(Math.floor((i + 1) * ratio), segments.length - 1);
+          return {
+            id: i,
+            start: segments[startIdx].start,
+            end: segments[endIdx].end,
+            text: line.trim()
+          };
+        });
+      }
+
+      // If we have more translated lines, use first N
+      return segments.map((segment, i) => ({
+        ...segment,
+        text: i < translatedLines.length ? translatedLines[i].trim() : segment.text
+      }));
+    }
+
+  } catch (error) {
+    console.error('[TRANSCRIBE] LLM translation error:', error.message);
+    // Fall back to original segments
+    return segments;
+  }
+}
 
 /**
  * Transcribe and translate an audio file to English
@@ -80,6 +228,15 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
     // Post-process segments for better quality
     const cleanedSegments = postProcessSegments(segments);
     console.log(`[TRANSCRIBE] Post-processed to ${cleanedSegments.length} segments`);
+
+    // Check if the output is romanized Hindi/Punjabi instead of English
+    // If so, use LLM to translate it properly
+    const fullText = cleanedSegments.map(s => s.text).join(' ');
+    if (needsLLMTranslation(fullText)) {
+      console.log('[TRANSCRIBE] Whisper output appears to be romanized - using LLM for translation');
+      const translatedSegments = await translateWithLLM(cleanedSegments);
+      return translatedSegments;
+    }
 
     return cleanedSegments;
 

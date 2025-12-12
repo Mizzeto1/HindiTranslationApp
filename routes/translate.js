@@ -3,6 +3,7 @@
  *
  * Handles the translation API endpoints for receiving YouTube URLs
  * and checking job status.
+ * Now includes authentication and usage tracking.
  */
 
 const express = require('express');
@@ -11,6 +12,8 @@ const { v4: uuidv4 } = require('uuid');
 const jobManager = require('../services/jobManager');
 const youtubeService = require('../services/youtube');
 const transcribeService = require('../services/transcribe');
+const userStorage = require('../services/userStorage');
+const { requireAuth, getUserEmail } = require('../middleware/auth');
 const fs = require('fs').promises;
 
 // YouTube URL validation regex
@@ -19,10 +22,14 @@ const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.)?(youtube\.com\/(watch\?v=|embe
 /**
  * POST /api/translate
  * Start a new translation job
+ * Protected: Requires Clerk authentication
  */
-router.post('/translate', async (req, res) => {
+router.post('/translate', requireAuth, async (req, res) => {
   try {
     const { youtubeUrl } = req.body;
+    const userId = req.userId;
+
+    console.log(`[TRANSLATE] Request from user: ${userId}`);
 
     // Validate request body
     if (!youtubeUrl) {
@@ -44,6 +51,10 @@ router.post('/translate', async (req, res) => {
 
     console.log(`[TRANSLATE] Received request for: ${youtubeUrl}`);
 
+    // Get user email and ensure user exists in storage
+    const email = await getUserEmail(userId);
+    await userStorage.getOrCreateUser(userId, email);
+
     // Check if yt-dlp is installed
     const ytdlpInstalled = await youtubeService.checkYtDlpInstalled();
     if (!ytdlpInstalled) {
@@ -54,19 +65,60 @@ router.post('/translate', async (req, res) => {
       });
     }
 
-    // Create a new job
+    // Check video duration BEFORE processing to verify usage limits
+    console.log(`[TRANSLATE] Checking video duration for usage limits...`);
+    let duration;
+    try {
+      duration = await youtubeService.getVideoDuration(youtubeUrl);
+      console.log(`[TRANSLATE] Video duration: ${duration} seconds`);
+    } catch (durationError) {
+      console.log(`[TRANSLATE] Error getting duration: ${durationError.message}`);
+      return res.status(400).json({
+        error: 'Video error',
+        message: durationError.message
+      });
+    }
+
+    // Limit to 15 minutes (900 seconds) per video
+    if (duration > 900) {
+      console.log(`[TRANSLATE] Video too long: ${duration} seconds`);
+      return res.status(400).json({
+        error: 'video_too_long',
+        message: `Video is too long (${Math.round(duration / 60)} minutes). Maximum allowed is 15 minutes per video.`
+      });
+    }
+
+    // Check user's remaining minutes BEFORE processing
+    const usageCheck = await userStorage.checkUsageLimit(userId, duration);
+    if (!usageCheck.canTranslate) {
+      console.log(`[TRANSLATE] Usage limit check failed for user ${userId}`);
+      return res.status(403).json(usageCheck.error);
+    }
+
+    // Create a new job with user ID
     const jobId = uuidv4();
     jobManager.createJob(jobId, youtubeUrl);
-    console.log(`[TRANSLATE] Created job: ${jobId}`);
+    // Store userId with the job for later deduction
+    const job = jobManager.getJob(jobId);
+    job.userId = userId;
+    job.videoDuration = duration;
+    console.log(`[TRANSLATE] Created job: ${jobId} for user: ${userId}`);
+
+    // Get current usage for response
+    const { remaining, used, limit } = await userStorage.getRemainingMinutes(userId);
 
     // Start processing in background (don't await)
-    processTranslation(jobId, youtubeUrl);
+    processTranslation(jobId, youtubeUrl, userId, duration);
 
-    // Return job ID immediately
+    // Return job ID immediately with usage info
     res.status(202).json({
       jobId,
       status: 'pending',
-      message: 'Translation job started'
+      message: 'Translation job started',
+      video_duration_minutes: Math.ceil(duration / 60),
+      minutes_remaining: remaining,
+      minutes_used: used,
+      minutes_limit: limit
     });
 
   } catch (error) {
@@ -108,6 +160,11 @@ router.get('/status/:jobId', (req, res) => {
   if (job.status === 'complete') {
     response.transcript = job.transcript;
     response.duration = job.duration;
+    // Include usage info if available
+    if (job.minutes_used !== undefined) {
+      response.minutes_used = job.minutes_used;
+      response.minutes_remaining = job.minutes_remaining;
+    }
   }
 
   // Include error if failed
@@ -121,22 +178,18 @@ router.get('/status/:jobId', (req, res) => {
 
 /**
  * Process the translation job asynchronously
+ * @param {string} jobId - The job ID
+ * @param {string} youtubeUrl - The YouTube URL
+ * @param {string} userId - The Clerk user ID
+ * @param {number} duration - Video duration in seconds (already validated)
  */
-async function processTranslation(jobId, youtubeUrl) {
+async function processTranslation(jobId, youtubeUrl, userId, duration) {
   let audioFilePath = null;
 
   try {
-    // Step 1: Check video duration
-    console.log(`[JOB ${jobId}] Checking video duration...`);
-    jobManager.updateJob(jobId, 'downloading', 10);
-
-    const duration = await youtubeService.getVideoDuration(youtubeUrl);
-    console.log(`[JOB ${jobId}] Video duration: ${duration} seconds`);
-
-    // Limit to 15 minutes (900 seconds)
-    if (duration > 900) {
-      throw new Error(`Video is too long (${Math.round(duration / 60)} minutes). Maximum allowed is 15 minutes.`);
-    }
+    // Step 1: Duration already checked, start downloading
+    console.log(`[JOB ${jobId}] Starting download for user: ${userId}`);
+    jobManager.updateJob(jobId, 'downloading', 20);
 
     // Step 2: Download audio
     console.log(`[JOB ${jobId}] Downloading audio...`);
@@ -154,8 +207,24 @@ async function processTranslation(jobId, youtubeUrl) {
     console.log(`[JOB ${jobId}] Transcription complete. Got ${transcript.length} segments.`);
     jobManager.updateJob(jobId, 'transcribing', 90);
 
-    // Step 4: Mark as complete
+    // Step 4: Deduct minutes from user's usage AFTER successful translation
+    let usageInfo = { minutes_used: 0, minutes_remaining: 0 };
+    if (userId) {
+      try {
+        usageInfo = await userStorage.deductMinutes(userId, duration);
+        console.log(`[JOB ${jobId}] Deducted ${Math.ceil(duration / 60)} minutes from user ${userId}`);
+      } catch (deductError) {
+        console.error(`[JOB ${jobId}] Failed to deduct minutes:`, deductError.message);
+        // Don't fail the job for usage tracking errors
+      }
+    }
+
+    // Step 5: Mark as complete with usage info
+    const job = jobManager.getJob(jobId);
     jobManager.completeJob(jobId, transcript, duration);
+    // Add usage info to the completed job
+    job.minutes_used = usageInfo.minutes_used;
+    job.minutes_remaining = usageInfo.minutes_remaining;
     console.log(`[JOB ${jobId}] Job completed successfully!`);
 
   } catch (error) {

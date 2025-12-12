@@ -14,6 +14,10 @@ temp/
 *.wav
 *.ogg
 
+# User data (subscription/usage tracking)
+data/
+users.json
+
 # Logs
 logs/
 *.log

@@ -1,273 +1,244 @@
 /**
- * LyricsMint Scraper Service
- *
- * Scrapes Hindi song lyrics and English translations from LyricsMint.com
- * Includes rate limiting and proper error handling.
+ * LyricsMint Scraper
+ * Searches and scrapes lyrics from lyricsmint.com
  */
 
 const cheerio = require('cheerio');
 
-// Rate limiting: max 1 request per second
+// Rate limiting
 let lastRequestTime = 0;
-const MIN_REQUEST_INTERVAL = 1000;
+const MIN_INTERVAL = 1200; // 1.2 seconds between requests
 
-// Common browser headers to avoid blocks
-const HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.5',
-  'Accept-Encoding': 'gzip, deflate',
-  'Connection': 'keep-alive',
-  'Upgrade-Insecure-Requests': '1'
-};
-
-/**
- * Rate-limited fetch with proper headers
- * @param {string} url
- * @returns {Promise<Response|null>}
- */
 async function rateLimitedFetch(url) {
   const now = Date.now();
-  const timeSinceLastRequest = now - lastRequestTime;
-
-  if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
-    await new Promise(r => setTimeout(r, MIN_REQUEST_INTERVAL - timeSinceLastRequest));
+  const wait = MIN_INTERVAL - (now - lastRequestTime);
+  if (wait > 0) {
+    await new Promise(r => setTimeout(r, wait));
   }
-
   lastRequestTime = Date.now();
 
+  console.log(`[LYRICSMINT] Fetching: ${url}`);
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5'
+    },
+    timeout: 15000
+  });
+
+  return response;
+}
+
+/**
+ * Search LyricsMint and get the first matching lyrics page URL
+ */
+async function searchLyricsMint(songTitle, artistName) {
   try {
-    const response = await fetch(url, {
-      headers: HEADERS,
-      timeout: 10000
-    });
+    // Build search query - song title is most important
+    let query = songTitle;
+    if (artistName && artistName.length > 0) {
+      query = `${songTitle} ${artistName}`;
+    }
+
+    const searchUrl = `https://www.lyricsmint.com/?s=${encodeURIComponent(query)}`;
+    console.log(`[LYRICSMINT] Searching: ${searchUrl}`);
+
+    const response = await rateLimitedFetch(searchUrl);
 
     if (!response.ok) {
-      console.log(`[LYRICSMINT] HTTP ${response.status} for: ${url}`);
+      console.log(`[LYRICSMINT] Search returned ${response.status}`);
       return null;
     }
 
-    return response;
+    const html = await response.text();
+    const $ = cheerio.load(html);
+
+    // LyricsMint search results are usually in article tags or entry-title links
+    // Look for the first lyrics link
+    const selectors = [
+      'article a[href*="lyricsmint.com"]',
+      '.entry-title a',
+      'h2.entry-title a',
+      '.post-title a',
+      'a[href*="/lyrics"]'
+    ];
+
+    let lyricsPageUrl = null;
+
+    for (const selector of selectors) {
+      const link = $(selector).first();
+      if (link.length > 0) {
+        const href = link.attr('href');
+        // Make sure it's a lyrics page, not a category/tag page
+        if (href && href.includes('lyricsmint.com') && !href.includes('/tag/') && !href.includes('/category/')) {
+          lyricsPageUrl = href;
+          break;
+        }
+      }
+    }
+
+    // Fallback: find any link that looks like a lyrics page
+    if (!lyricsPageUrl) {
+      $('a').each((i, el) => {
+        const href = $(el).attr('href');
+        if (href && href.includes('lyricsmint.com/') && href.split('/').length >= 5) {
+          // URL like lyricsmint.com/artist/song has 5+ parts when split
+          lyricsPageUrl = href;
+          return false; // break
+        }
+      });
+    }
+
+    if (lyricsPageUrl) {
+      console.log(`[LYRICSMINT] Found lyrics page: ${lyricsPageUrl}`);
+      return lyricsPageUrl;
+    }
+
+    console.log('[LYRICSMINT] No lyrics page found in search results');
+    return null;
+
   } catch (error) {
-    console.error('[LYRICSMINT] Fetch error:', error.message);
+    console.error('[LYRICSMINT] Search error:', error.message);
     return null;
   }
 }
 
 /**
- * Build possible LyricsMint URL slugs for a song
- * @param {string} title
- * @param {string} artist
- * @returns {string[]}
+ * Scrape lyrics from a LyricsMint lyrics page
  */
-function buildPossibleUrls(title, artist) {
-  const urls = [];
-
-  // Clean and slugify
-  const slugify = (str) => str.toLowerCase()
-    .replace(/['']/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .trim();
-
-  const titleSlug = slugify(title);
-  const artistSlug = slugify(artist);
-
-  // Common URL patterns on LyricsMint
-  if (artistSlug && titleSlug) {
-    urls.push(`https://www.lyricsmint.com/${artistSlug}/${titleSlug}`);
-    urls.push(`https://www.lyricsmint.com/${titleSlug}-lyrics`);
-    urls.push(`https://www.lyricsmint.com/${titleSlug}-${artistSlug}`);
-  }
-
-  if (titleSlug) {
-    urls.push(`https://www.lyricsmint.com/${titleSlug}`);
-    urls.push(`https://www.lyricsmint.com/${titleSlug}-lyrics`);
-  }
-
-  return urls;
-}
-
-/**
- * Scrape lyrics from a LyricsMint page
- * @param {string} html
- * @returns {{hindiLyrics: string, englishTranslation: string|null}|null}
- */
-function scrapeLyricsFromHtml(html) {
+async function scrapeLyricsPage(pageUrl) {
   try {
+    const response = await rateLimitedFetch(pageUrl);
+
+    if (!response.ok) {
+      console.log(`[LYRICSMINT] Page returned ${response.status}`);
+      return null;
+    }
+
+    const html = await response.text();
     const $ = cheerio.load(html);
 
-    let hindiLyrics = '';
-    let englishTranslation = '';
+    // Remove script and style tags
+    $('script, style, noscript').remove();
 
-    // LyricsMint typically structures lyrics in entry-content
-    // Hindi and English are often in separate sections or alternating paragraphs
-
-    // Try to find lyrics container
-    const contentSelectors = [
+    // LyricsMint puts lyrics in various containers
+    // Try multiple selectors
+    const lyricsSelectors = [
       '.entry-content',
       '.lyrics-content',
       '.song-lyrics',
+      '.lyrics',
       'article .content',
       '.post-content'
     ];
 
-    let $content = null;
-    for (const sel of contentSelectors) {
-      if ($(sel).length > 0) {
-        $content = $(sel);
-        break;
+    let lyricsHtml = '';
+
+    for (const selector of lyricsSelectors) {
+      const container = $(selector).first();
+      if (container.length > 0) {
+        // Get the HTML and process it
+        lyricsHtml = container.html();
+        if (lyricsHtml && lyricsHtml.length > 200) {
+          break;
+        }
       }
     }
 
-    if (!$content) {
-      console.log('[LYRICSMINT] Could not find content container');
+    if (!lyricsHtml || lyricsHtml.length < 200) {
+      console.log('[LYRICSMINT] Could not find lyrics container');
       return null;
     }
 
-    // Extract text - LyricsMint often has Hindi in one block and English in another
-    // Or they alternate paragraphs
-    const paragraphs = $content.find('p').toArray();
+    // Convert HTML to text, preserving line breaks
+    // Replace <br> and </p> with newlines
+    let lyrics = lyricsHtml
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n\n')
+      .replace(/<\/div>/gi, '\n')
+      .replace(/<[^>]+>/g, '') // Remove remaining HTML tags
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&#?[a-z0-9]+;/gi, '') // Remove other HTML entities
+      .trim();
 
-    const hindiLines = [];
-    const englishLines = [];
+    // Clean up excessive whitespace
+    lyrics = lyrics
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.length > 0)
+      .join('\n');
 
-    paragraphs.forEach((p) => {
-      const text = $(p).text().trim();
-      if (!text || text.length < 3) return;
+    // Remove common non-lyrics content
+    const removePatterns = [
+      /^lyrics\s*$/im,
+      /^song\s*$/im,
+      /^singer[:\s]/im,
+      /^music[:\s]/im,
+      /^composer[:\s]/im,
+      /^lyricist[:\s]/im,
+      /^movie[:\s]/im,
+      /^album[:\s]/im,
+      /^label[:\s]/im,
+      /^share this/im,
+      /^copyright/im,
+      /^all rights reserved/im,
+      /^\[.*\]$/m
+    ];
 
-      // Skip navigation/metadata
-      if (text.includes('Lyrics:') || text.includes('Singer:') ||
-        text.includes('Music:') || text.includes('Movie:')) return;
-
-      // Detect if text is Hindi (contains Devanagari) or English (mostly Latin)
-      const hasDevanagari = /[\u0900-\u097F]/.test(text);
-      const hasArabic = /[\u0600-\u06FF]/.test(text);  // Urdu script
-      const isLatin = /^[a-zA-Z\s,.'!?()-]+$/.test(text.replace(/\s+/g, ' '));
-
-      if (hasDevanagari || hasArabic) {
-        // This is Hindi/Urdu script - we want romanized, skip this
-      } else if (isLatin && text.length > 20) {
-        // Could be English translation or romanized Hindi
-        // Heuristic: if it looks like a translation (complete sentences), add to English
-        // Otherwise treat as romanized Hindi
-        const looksLikeTranslation = /\b(the|is|are|you|me|my|your|love|heart|I)\b/i.test(text);
-        if (looksLikeTranslation) {
-          englishLines.push(text);
-        } else {
-          hindiLines.push(text);
-        }
-      } else {
-        // Mixed or romanized Hindi
-        hindiLines.push(text);
-      }
+    let lines = lyrics.split('\n');
+    lines = lines.filter(line => {
+      const trimmed = line.trim();
+      return !removePatterns.some(pattern => pattern.test(trimmed));
     });
 
-    // If we didn't get good separation, just get all text
-    if (hindiLines.length === 0 && englishLines.length === 0) {
-      const allText = $content.text().trim();
-      if (allText.length > 100) {
-        hindiLines.push(allText);
-      }
-    }
+    lyrics = lines.join('\n').trim();
 
-    hindiLyrics = hindiLines.join('\n\n');
-    englishTranslation = englishLines.length > 0 ? englishLines.join('\n\n') : null;
-
-    if (hindiLyrics.length < 50) {
-      console.log('[LYRICSMINT] Extracted lyrics too short');
+    if (lyrics.length < 100) {
+      console.log('[LYRICSMINT] Extracted lyrics too short, probably not actual lyrics');
       return null;
     }
 
-    console.log(`[LYRICSMINT] Extracted ${hindiLyrics.length} chars Hindi, ${englishTranslation?.length || 0} chars English`);
+    console.log(`[LYRICSMINT] Extracted ${lyrics.length} chars of lyrics`);
 
     return {
-      hindiLyrics,
-      englishTranslation
+      hindiLyrics: lyrics,
+      englishTranslation: null // LyricsMint sometimes has translations, but parsing is complex
     };
+
   } catch (error) {
-    console.error('[LYRICSMINT] Parse error:', error.message);
+    console.error('[LYRICSMINT] Scrape error:', error.message);
     return null;
   }
 }
 
 /**
- * Search LyricsMint for a song using their search page
- * @param {string} songTitle
- * @param {string} artistName
- * @returns {Promise<string|null>} URL of the lyrics page
- */
-async function searchLyricsMint(songTitle, artistName) {
-  const query = `${songTitle} ${artistName}`.trim();
-  const searchUrl = `https://www.lyricsmint.com/?s=${encodeURIComponent(query)}`;
-
-  console.log(`[LYRICSMINT] Searching: ${searchUrl}`);
-
-  const response = await rateLimitedFetch(searchUrl);
-  if (!response) return null;
-
-  try {
-    const html = await response.text();
-    const $ = cheerio.load(html);
-
-    // Find first search result link
-    const resultLink = $('article a, .entry-title a, h2 a').first().attr('href');
-
-    if (resultLink) {
-      console.log(`[LYRICSMINT] Found search result: ${resultLink}`);
-      return resultLink;
-    }
-
-    return null;
-  } catch (error) {
-    console.error('[LYRICSMINT] Search parse error:', error.message);
-    return null;
-  }
-}
-
-/**
- * Main function: fetch lyrics for a song
- * @param {string} songTitle
- * @param {string} artistName
- * @returns {Promise<{hindiLyrics: string, englishTranslation: string|null}|null>}
+ * Main function: search for and fetch lyrics
  */
 async function fetchLyrics(songTitle, artistName) {
   console.log(`[LYRICSMINT] Fetching lyrics for: "${songTitle}" by "${artistName}"`);
 
-  // Strategy 1: Try direct URL patterns
-  const possibleUrls = buildPossibleUrls(songTitle, artistName);
-
-  for (const url of possibleUrls) {
-    console.log(`[LYRICSMINT] Trying: ${url}`);
-    const response = await rateLimitedFetch(url);
-
-    if (response) {
-      const html = await response.text();
-      const lyrics = scrapeLyricsFromHtml(html);
-      if (lyrics) {
-        return lyrics;
-      }
-    }
+  if (!songTitle || songTitle.length < 2) {
+    console.log('[LYRICSMINT] Song title too short');
+    return null;
   }
 
-  // Strategy 2: Use search
-  const searchResultUrl = await searchLyricsMint(songTitle, artistName);
-  if (searchResultUrl) {
-    const response = await rateLimitedFetch(searchResultUrl);
-    if (response) {
-      const html = await response.text();
-      const lyrics = scrapeLyricsFromHtml(html);
-      if (lyrics) {
-        return lyrics;
-      }
-    }
+  // Search for the song
+  const pageUrl = await searchLyricsMint(songTitle, artistName);
+
+  if (!pageUrl) {
+    console.log('[LYRICSMINT] No lyrics page found');
+    return null;
   }
 
-  console.log('[LYRICSMINT] No lyrics found');
-  return null;
+  // Scrape the lyrics page
+  const lyrics = await scrapeLyricsPage(pageUrl);
+
+  return lyrics;
 }
 
-module.exports = {
-  fetchLyrics
-};
+module.exports = { fetchLyrics, searchLyricsMint, scrapeLyricsPage };

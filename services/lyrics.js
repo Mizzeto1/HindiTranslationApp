@@ -12,51 +12,92 @@ const lyricsDb = require('./lyricsDb');
 const lyricsMintScraper = require('./lyricsMintScraper');
 
 /**
- * Parse YouTube video title to extract song info
- * Common formats:
- * - "Artist - Song Title"
- * - "Song Title | Artist"
- * - "Song Title (Official Video) - Artist"
+ * Parse YouTube video title to extract song and artist
+ * Handles common Bollywood title formats:
+ * - "Tum Hi Ho" Full Video Song | Arijit Singh | Aashiqui 2
+ * - Arijit Singh - Tum Hi Ho (Official Video)
+ * - Tu Mane Ya Na Mane Dildara – Live | Lakhwinder Wadali | Sufi Mehfil
+ * - Woh Lamhe Woh Baatein | Atif Aslam | Zeher
  * @param {string} videoTitle
  * @returns {{title: string, artist: string}}
  */
 function parseVideoTitle(videoTitle) {
-  // Clean up common suffixes
+  // Remove common suffixes first
   let cleaned = videoTitle
     .replace(/\(official\s*(music\s*)?video\)/gi, '')
     .replace(/\(official\s*audio\)/gi, '')
-    .replace(/\(lyric\s*video\)/gi, '')
-    .replace(/\(lyrics?\)/gi, '')
-    .replace(/\[official\s*video\]/gi, '')
-    .replace(/\|?\s*full\s*video/gi, '')
-    .replace(/\|?\s*audio/gi, '')
-    .replace(/\|?\s*hd/gi, '')
-    .replace(/\|?\s*4k/gi, '')
-    .replace(/ft\.?\s*[^-|]+/gi, '')
-    .replace(/feat\.?\s*[^-|]+/gi, '')
+    .replace(/\(lyric[s]?\s*video\)/gi, '')
+    .replace(/\(full\s*(video\s*)?(song)?(\s*video)?\)/gi, '')
+    .replace(/\|\s*full\s*video(\s*song)?/gi, '')
+    .replace(/\[.*?\]/g, '') // Remove [anything]
+    .replace(/–\s*live/gi, '') // Remove "– Live"
+    .replace(/-\s*live/gi, '')
+    .replace(/\|\s*lyric[s]?/gi, '')
+    .replace(/\|\s*audio/gi, '')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Try different separators
-  const separators = [' - ', ' | ', ' : ', ' – ', ' — '];
+  // Try to extract quoted song title first: "Song Name" ... Artist
+  const quotedMatch = cleaned.match(/[""]([^""]+)[""].*?\|\s*([^|]+)/i);
+  if (quotedMatch) {
+    return {
+      title: quotedMatch[1].trim(),
+      artist: quotedMatch[2].trim().split('|')[0].trim()
+    };
+  }
 
-  for (const sep of separators) {
-    if (cleaned.includes(sep)) {
-      const parts = cleaned.split(sep).map(p => p.trim());
-      if (parts.length >= 2) {
-        return {
-          artist: parts[0],
-          title: parts.slice(1).join(' ')
-        };
+  // Split by | and analyze parts
+  const pipeParts = cleaned.split('|').map(p => p.trim()).filter(p => p.length > 0);
+
+  if (pipeParts.length >= 2) {
+    // First part is usually song, second is usually artist
+    // But filter out noise words from artist
+    const noiseWords = ['full video', 'video song', 'audio', 'lyrics', 'hd', '4k', 'sufi mehfil', 'my fm', 'unplugged'];
+
+    let songPart = pipeParts[0];
+    let artistPart = null;
+
+    // Find the first part that looks like an artist name (not noise)
+    for (let i = 1; i < pipeParts.length; i++) {
+      const part = pipeParts[i].toLowerCase();
+      const isNoise = noiseWords.some(noise => part.includes(noise));
+      if (!isNoise && pipeParts[i].length > 2) {
+        artistPart = pipeParts[i];
+        break;
       }
+    }
+
+    // Clean up song part - remove artist if duplicated
+    if (artistPart && songPart.toLowerCase().includes(artistPart.toLowerCase())) {
+      songPart = songPart.replace(new RegExp(artistPart, 'gi'), '').trim();
+    }
+
+    // Remove trailing separators from song
+    songPart = songPart.replace(/[-–|:]\s*$/, '').trim();
+
+    return {
+      title: songPart || pipeParts[0],
+      artist: artistPart || ''
+    };
+  }
+
+  // Try "Artist - Song" or "Song - Artist" format
+  const dashParts = cleaned.split(/\s*[-–]\s*/);
+  if (dashParts.length >= 2) {
+    // Heuristic: Bollywood artists are usually shorter names
+    // If first part has more words, it's probably the song
+    const firstWords = dashParts[0].split(' ').length;
+    const secondWords = dashParts[1].split(' ').length;
+
+    if (firstWords > secondWords) {
+      return { title: dashParts[0], artist: dashParts[1] };
+    } else {
+      return { title: dashParts[1], artist: dashParts[0] };
     }
   }
 
-  // If no separator found, use the whole thing as title
-  return {
-    title: cleaned,
-    artist: ''
-  };
+  // Fallback: whole thing is the title
+  return { title: cleaned, artist: '' };
 }
 
 /**
@@ -117,7 +158,7 @@ async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
   console.log(`[LYRICS] Searching lyrics for: "${videoTitle}"`);
 
   const { title, artist } = parseVideoTitle(videoTitle);
-  console.log(`[LYRICS] Parsed: artist="${artist}", title="${title}"`);
+  console.log(`[LYRICS] Parsed: song="${title}", artist="${artist}"`);
 
   const youtubeId = extractVideoId(youtubeUrl);
 

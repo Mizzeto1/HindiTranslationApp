@@ -286,40 +286,153 @@ async function searchWithDuckDuckGo(songTitle, artistName) {
 }
 
 /**
- * Main search function - tries multiple methods
+ * Main search function - tries multiple methods with verbose logging
  */
 async function searchLyricsMint(songTitle, artistName) {
-  console.log(`[LYRICSMINT] Searching for: "${songTitle}" by "${artistName}"`);
+  console.log('[LYRICSMINT] ============ SEARCH START ============');
+  console.log('[LYRICSMINT] Input songTitle:', songTitle);
+  console.log('[LYRICSMINT] Input artistName:', artistName);
 
-  // Clean song title
-  const cleanTitle = songTitle
-    .replace(/["'"]/g, '')
-    .replace(/\s*\(.*?\)\s*/g, '')
-    .replace(/\s*\|.*$/g, '')
-    .trim();
+  try {
+    // Clean song title
+    const cleanTitle = songTitle
+      .replace(/["'"]/g, '')
+      .replace(/\s*\(.*?\)\s*/g, '')
+      .replace(/\s*\|.*$/g, '')
+      .trim();
 
-  // Try Google first
-  let url = await searchWithGoogle(cleanTitle, artistName);
+    console.log('[LYRICSMINT] Cleaned title:', cleanTitle);
 
-  // If Google fails/blocks, try DuckDuckGo
-  if (!url) {
-    console.log('[LYRICSMINT] Google failed, trying DuckDuckGo...');
-    url = await searchWithDuckDuckGo(cleanTitle, artistName);
+    // Try Google search
+    console.log('[LYRICSMINT] Attempting Google search...');
+
+    const query = `${cleanTitle} ${artistName || ''} lyrics site:lyricsmint.com`.trim();
+    const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+
+    console.log('[LYRICSMINT] Google query:', query);
+    console.log('[LYRICSMINT] Google URL:', googleUrl);
+
+    let response;
+    try {
+      response = await fetch(googleUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html',
+          'Accept-Language': 'en-US,en;q=0.5'
+        }
+      });
+      console.log('[LYRICSMINT] Google response status:', response.status);
+    } catch (fetchError) {
+      console.log('[LYRICSMINT] Google fetch FAILED:', fetchError.message);
+    }
+
+    if (response && response.ok) {
+      const html = await response.text();
+      console.log('[LYRICSMINT] Google HTML length:', html.length);
+
+      // Check for blocking
+      if (html.includes('unusual traffic') || html.includes('captcha') || html.includes('CAPTCHA')) {
+        console.log('[LYRICSMINT] Google is BLOCKING us (captcha/unusual traffic)');
+      } else {
+        // Look for lyricsmint URLs
+        const urlPattern = /(https?:\/\/(www\.)?lyricsmint\.com\/[a-z0-9-]+\/[a-z0-9-]+)/gi;
+        const matches = html.match(urlPattern) || [];
+        const uniqueMatches = [...new Set(matches)].filter(url => isValidLyricsUrl(url));
+
+        console.log('[LYRICSMINT] Found lyricsmint URLs:', uniqueMatches.length);
+        uniqueMatches.slice(0, 5).forEach((url, i) => {
+          console.log(`[LYRICSMINT]   ${i + 1}. ${url}`);
+        });
+
+        if (uniqueMatches.length > 0) {
+          console.log('[LYRICSMINT] Using first match:', uniqueMatches[0]);
+          console.log('[LYRICSMINT] ============ SEARCH END ============');
+          return uniqueMatches[0];
+        }
+      }
+    }
+
+    // Fallback: Try DuckDuckGo
+    console.log('[LYRICSMINT] Trying DuckDuckGo fallback...');
+
+    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    console.log('[LYRICSMINT] DuckDuckGo URL:', ddgUrl);
+
+    try {
+      const ddgResponse = await fetch(ddgUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      console.log('[LYRICSMINT] DuckDuckGo response status:', ddgResponse.status);
+
+      if (ddgResponse.ok) {
+        const ddgHtml = await ddgResponse.text();
+        console.log('[LYRICSMINT] DuckDuckGo HTML length:', ddgHtml.length);
+
+        const ddgMatches = (ddgHtml.match(/(https?:\/\/(www\.)?lyricsmint\.com\/[a-z0-9-]+\/[a-z0-9-]+)/gi) || [])
+          .filter(url => isValidLyricsUrl(url));
+        console.log('[LYRICSMINT] DuckDuckGo found URLs:', ddgMatches.length);
+
+        if (ddgMatches.length > 0) {
+          console.log('[LYRICSMINT] Using DuckDuckGo result:', ddgMatches[0]);
+          console.log('[LYRICSMINT] ============ SEARCH END ============');
+          return ddgMatches[0];
+        }
+      }
+    } catch (ddgError) {
+      console.log('[LYRICSMINT] DuckDuckGo FAILED:', ddgError.message);
+    }
+
+    // Last fallback: Direct URL construction
+    console.log('[LYRICSMINT] Trying direct URL construction...');
+
+    const artistSlug = (artistName || 'unknown')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/^-+|-+$/g, '');
+
+    const songSlug = cleanTitle
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, '')
+      .replace(/\s+/g, '-')
+      .replace(/^-+|-+$/g, '');
+
+    console.log('[LYRICSMINT] Artist slug:', artistSlug);
+    console.log('[LYRICSMINT] Song slug:', songSlug);
+
+    const directUrl = `https://www.lyricsmint.com/${artistSlug}/${songSlug}`;
+    console.log('[LYRICSMINT] Direct URL:', directUrl);
+
+    try {
+      const directResponse = await fetch(directUrl, {
+        method: 'HEAD',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      });
+      console.log('[LYRICSMINT] Direct URL status:', directResponse.status);
+
+      if (directResponse.ok) {
+        console.log('[LYRICSMINT] Direct URL EXISTS!');
+        console.log('[LYRICSMINT] ============ SEARCH END ============');
+        return directUrl;
+      }
+    } catch (directError) {
+      console.log('[LYRICSMINT] Direct URL check FAILED:', directError.message);
+    }
+
+    console.log('[LYRICSMINT] All methods failed - no lyrics URL found');
+    console.log('[LYRICSMINT] ============ SEARCH END ============');
+    return null;
+
+  } catch (error) {
+    console.log('[LYRICSMINT] FATAL ERROR:', error.message);
+    console.log('[LYRICSMINT] Stack:', error.stack);
+    console.log('[LYRICSMINT] ============ SEARCH END ============');
+    return null;
   }
-
-  // Last resort: direct URL construction
-  if (!url) {
-    console.log('[LYRICSMINT] Search engines failed, trying direct URL...');
-    url = await tryDirectUrl(cleanTitle, artistName);
-  }
-
-  if (url) {
-    console.log('[LYRICSMINT] Final URL:', url);
-  } else {
-    console.log('[LYRICSMINT] No lyrics URL found');
-  }
-
-  return url;
 }
 
 /**

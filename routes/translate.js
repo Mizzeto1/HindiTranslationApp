@@ -420,11 +420,7 @@ async function processTranslation(jobId, youtubeUrl, userId, duration) {
         transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
           videoTitle: metadata.title
         });
-
-        // Save Groq transcription to cache for future users
-        const transcriptText = transcript.map(s => s.text).join('\n');
-        await lyricsService.saveTranscriptionToCache(youtubeUrl, metadata.title || '', transcriptText);
-        console.log(`[JOB ${jobId}] Saved Groq transcription to lyrics cache`);
+        // Note: Groq results are NOT cached - each transcription is unique to the audio
       } catch (transcribeError) {
         console.error(`[JOB ${jobId}] Transcription failed: ${transcribeError.message}`);
         throw new Error(`Failed to transcribe audio: ${transcribeError.message}`);

@@ -37,64 +37,104 @@ async function rateLimitedFetch(url) {
  */
 async function searchLyricsMint(songTitle, artistName) {
   try {
-    // Build search query - song title is most important
+    // Use just song title for search - artist names from YouTube often include actors
     let query = songTitle;
-    if (artistName && artistName.length > 0) {
-      query = `${songTitle} ${artistName}`;
-    }
 
     const searchUrl = `https://www.lyricsmint.com/?s=${encodeURIComponent(query)}`;
-    console.log(`[LYRICSMINT] Searching: ${searchUrl}`);
+    console.log(`[LYRICSMINT] Search URL: ${searchUrl}`);
 
     const response = await rateLimitedFetch(searchUrl);
 
     if (!response.ok) {
-      console.log(`[LYRICSMINT] Search returned ${response.status}`);
+      console.log(`[LYRICSMINT] Search HTTP status: ${response.status}`);
       return null;
     }
 
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    // LyricsMint search results are usually in article tags or entry-title links
-    const selectors = [
-      'article a[href*="lyricsmint.com"]',
-      '.entry-title a',
-      'h2.entry-title a',
-      '.post-title a',
-      'a[href*="/lyrics"]'
-    ];
+    console.log(`[LYRICSMINT] HTML length: ${html.length}`);
 
+    // Find search result links - they follow pattern: /artist-name/song-name
+    // Exclude homepage, category, tag, and author links
     let lyricsPageUrl = null;
 
-    for (const selector of selectors) {
-      const link = $(selector).first();
-      if (link.length > 0) {
-        const href = link.attr('href');
-        if (href && href.includes('lyricsmint.com') && !href.includes('/tag/') && !href.includes('/category/')) {
-          lyricsPageUrl = href;
-          break;
-        }
-      }
-    }
+    // Look for article links in search results
+    $('article a, .entry-title a, h2 a, h3 a').each((i, el) => {
+      const href = $(el).attr('href');
 
-    // Fallback: find any link that looks like a lyrics page
+      if (!href) return;
+
+      // Skip if it's just the homepage
+      if (href === 'https://lyricsmint.com/' ||
+          href === 'https://www.lyricsmint.com/' ||
+          href === 'http://lyricsmint.com/' ||
+          href === 'http://www.lyricsmint.com/' ||
+          href === '/' ||
+          href.match(/^https?:\/\/(www\.)?lyricsmint\.com\/?$/)) {
+        return;
+      }
+
+      // Skip category, tag, author, page links
+      if (href.includes('/category/') ||
+          href.includes('/tag/') ||
+          href.includes('/author/') ||
+          href.includes('/page/') ||
+          href.includes('?') ||
+          href.includes('#')) {
+        return;
+      }
+
+      // Valid lyrics URL should have format: lyricsmint.com/artist/song
+      // Count the path segments
+      const pathMatch = href.match(/lyricsmint\.com\/([^\/]+)\/([^\/]+)/);
+      if (pathMatch) {
+        console.log(`[LYRICSMINT] Found valid lyrics URL: ${href}`);
+        lyricsPageUrl = href;
+        return false; // break the loop
+      }
+
+      // Also try relative URLs
+      if (href.startsWith('/') && href.split('/').filter(Boolean).length >= 2) {
+        const fullUrl = `https://www.lyricsmint.com${href}`;
+        console.log(`[LYRICSMINT] Found valid lyrics URL (relative): ${fullUrl}`);
+        lyricsPageUrl = fullUrl;
+        return false;
+      }
+    });
+
+    // Fallback: look for any link containing the song title slug
     if (!lyricsPageUrl) {
+      const songSlug = songTitle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      console.log(`[LYRICSMINT] Looking for links containing: ${songSlug}`);
+
       $('a').each((i, el) => {
         const href = $(el).attr('href');
-        if (href && href.includes('lyricsmint.com/') && href.split('/').length >= 5) {
-          lyricsPageUrl = href;
-          return false; // break
+        if (href && href.toLowerCase().includes(songSlug)) {
+          // Verify it's a lyrics page URL (has artist/song structure)
+          const pathMatch = href.match(/lyricsmint\.com\/([^\/]+)\/([^\/]+)/);
+          if (pathMatch) {
+            console.log(`[LYRICSMINT] Found URL by slug match: ${href}`);
+            lyricsPageUrl = href;
+            return false;
+          }
         }
       });
     }
 
     if (lyricsPageUrl) {
-      console.log(`[LYRICSMINT] Found lyrics page: ${lyricsPageUrl}`);
+      console.log(`[LYRICSMINT] Selected lyrics page: ${lyricsPageUrl}`);
       return lyricsPageUrl;
     }
 
-    console.log('[LYRICSMINT] No lyrics page found in search results');
+    console.log('[LYRICSMINT] No valid lyrics page found in search results');
+
+    // Debug: log first 10 links to help diagnose
+    console.log('[LYRICSMINT] Debug - First 10 links on page:');
+    $('a').slice(0, 10).each((i, el) => {
+      console.log(`  ${i}: ${$(el).attr('href')}`);
+    });
+
     return null;
 
   } catch (error) {

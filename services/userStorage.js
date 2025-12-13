@@ -58,6 +58,7 @@ async function initDatabase() {
         song_title VARCHAR(255),
         artist_name VARCHAR(255),
         youtube_id VARCHAR(50),
+        romanized_lyrics TEXT,
         hindi_lyrics TEXT,
         english_translation TEXT,
         source VARCHAR(50) DEFAULT 'lyricsmint',
@@ -66,6 +67,11 @@ async function initDatabase() {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(youtube_id)
       )
+    `);
+
+    // Add romanized_lyrics column if it doesn't exist (for existing deployments)
+    await pool.query(`
+      ALTER TABLE song_lyrics ADD COLUMN IF NOT EXISTS romanized_lyrics TEXT
     `);
 
     // Full-text search index for song lookup

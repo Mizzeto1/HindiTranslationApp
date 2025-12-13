@@ -6,10 +6,16 @@
  * 2. LyricsMint scraper (if not cached)
  *
  * Falls back to Groq transcription if lyrics not found.
+ *
+ * Returns segments with both romanized Hindi and English translation.
  */
 
+const Groq = require('groq-sdk');
 const lyricsDb = require('./lyricsDb');
 const lyricsMintScraper = require('./lyricsMintScraper');
+
+// Initialize Groq client
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 /**
  * Parse YouTube video title to extract song and artist
@@ -101,21 +107,101 @@ function parseVideoTitle(videoTitle) {
 }
 
 /**
- * Convert lyrics text to timestamped segments
- * Since we don't have actual timestamps, we estimate based on video duration
+ * Translate romanized Hindi lyrics to actual English
+ * @param {string} romanizedLyrics - Hindi lyrics in English letters (e.g., "Tum hi ho")
+ * @returns {Promise<string|null>} - Actual English translation
+ */
+async function translateToEnglish(romanizedLyrics) {
+  if (!romanizedLyrics || romanizedLyrics.length < 10) {
+    return null;
+  }
+
+  if (!process.env.GROQ_API_KEY) {
+    console.error('[LYRICS] GROQ_API_KEY not set, cannot translate');
+    return null;
+  }
+
+  try {
+    console.log('[LYRICS] Translating romanized Hindi to English...');
+
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.1-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a Hindi to English translator specializing in Bollywood song lyrics.
+
+Your task:
+- Translate the romanized Hindi lyrics to natural English
+- Keep the SAME number of lines as the input
+- Each output line should be the translation of the corresponding input line
+- Capture the poetic meaning, not just literal translation
+- Output ONLY the English translation, no explanations or notes
+- Do not include line numbers or any other formatting
+- If a line is a repetition (like "Tum hi ho, tum hi ho"), translate it as repetition too`
+        },
+        {
+          role: 'user',
+          content: romanizedLyrics
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 4000
+    });
+
+    const translation = response.choices[0].message.content.trim();
+    console.log(`[LYRICS] Translation complete: ${translation.length} chars`);
+
+    return translation;
+
+  } catch (error) {
+    console.error('[LYRICS] Translation error:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Convert lyrics to timestamped segments with romanized Hindi and English
+ * @param {string} romanizedLyrics - Hindi in English letters
+ * @param {string} englishLyrics - Actual English translation
+ * @param {number} durationSeconds - Video duration
+ * @returns {Array} Segments with id, start, end, romanized, english
+ */
+function lyricsToSegments(romanizedLyrics, englishLyrics, durationSeconds) {
+  if (!romanizedLyrics) return [];
+
+  const romanizedLines = romanizedLyrics.split('\n').filter(line => line.trim().length > 0);
+  const englishLines = englishLyrics ? englishLyrics.split('\n').filter(line => line.trim().length > 0) : [];
+
+  const lineCount = romanizedLines.length;
+  if (lineCount === 0) return [];
+
+  const timePerLine = durationSeconds / lineCount;
+
+  return romanizedLines.map((romanizedLine, index) => ({
+    id: index,
+    start: index * timePerLine,
+    end: (index + 1) * timePerLine,
+    romanized: romanizedLine.trim(),
+    english: englishLines[index]?.trim() || '',
+    // For backwards compatibility, also include 'text' field
+    text: englishLines[index]?.trim() || romanizedLine.trim()
+  }));
+}
+
+/**
+ * Legacy function: Convert lyrics text to timestamped segments (old format)
+ * Kept for backwards compatibility with Groq fallback
  * @param {string} lyrics
  * @param {number} durationSeconds
  * @returns {Array}
  */
-function lyricsToSegments(lyrics, durationSeconds) {
+function lyricsToSegmentsLegacy(lyrics, durationSeconds) {
   if (!lyrics) return [];
 
-  // Split lyrics into lines, filter empty ones
   const lines = lyrics.split('\n').filter(line => line.trim().length > 0);
-
   if (lines.length === 0) return [];
 
-  // Estimate time per line
   const timePerLine = durationSeconds / lines.length;
 
   return lines.map((line, index) => ({
@@ -152,7 +238,7 @@ function extractVideoId(url) {
  * @param {string} videoTitle - YouTube video title
  * @param {number} durationSeconds - Video duration
  * @param {string} youtubeUrl - YouTube URL (optional, for caching)
- * @returns {Promise<{found: boolean, segments: Array, source: string, hindiLyrics?: string, englishTranslation?: string}>}
+ * @returns {Promise<{found: boolean, segments: Array, source: string}>}
  */
 async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
   console.log(`[LYRICS] Searching lyrics for: "${videoTitle}"`);
@@ -165,59 +251,76 @@ async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
   // 1. Check Postgres cache by YouTube ID first (exact match)
   if (youtubeId) {
     const cachedById = await lyricsDb.getByYoutubeId(youtubeId);
-    if (cachedById) {
-      const segments = lyricsToSegments(cachedById.hindi_lyrics, durationSeconds);
+    if (cachedById && cachedById.romanized_lyrics && cachedById.english_translation) {
+      console.log('[LYRICS] Cache hit by YouTube ID (with romanized + english)');
+      const segments = lyricsToSegments(cachedById.romanized_lyrics, cachedById.english_translation, durationSeconds);
       return {
         found: true,
         segments,
         source: 'cache',
-        originalSource: cachedById.source,
-        hindiLyrics: cachedById.hindi_lyrics,
-        englishTranslation: cachedById.english_translation
+        originalSource: cachedById.source
       };
     }
   }
 
   // 2. Check Postgres cache by title/artist (fuzzy match)
   const cachedByTitle = await lyricsDb.searchByTitleArtist(title, artist);
-  if (cachedByTitle) {
-    const segments = lyricsToSegments(cachedByTitle.hindi_lyrics, durationSeconds);
+  if (cachedByTitle && cachedByTitle.romanized_lyrics && cachedByTitle.english_translation) {
+    console.log('[LYRICS] Cache hit by title/artist (with romanized + english)');
+    const segments = lyricsToSegments(cachedByTitle.romanized_lyrics, cachedByTitle.english_translation, durationSeconds);
     return {
       found: true,
       segments,
       source: 'cache',
-      originalSource: cachedByTitle.source,
-      hindiLyrics: cachedByTitle.hindi_lyrics,
-      englishTranslation: cachedByTitle.english_translation
+      originalSource: cachedByTitle.source
     };
   }
 
   // 3. Try LyricsMint scraper
   const scraped = await lyricsMintScraper.fetchLyrics(title, artist);
-  if (scraped && scraped.hindiLyrics) {
+
+  if (scraped && scraped.romanizedLyrics) {
+    console.log(`[LYRICS] Found romanized lyrics on LyricsMint (${scraped.romanizedLyrics.length} chars)`);
+
+    // Translate romanized Hindi to actual English
+    const englishTranslation = await translateToEnglish(scraped.romanizedLyrics);
+
+    if (!englishTranslation) {
+      console.log('[LYRICS] Translation failed, falling back to Groq audio transcription');
+      return {
+        found: false,
+        segments: [],
+        source: null
+      };
+    }
+
     // Save to cache for next time
     if (youtubeId) {
       await lyricsDb.saveLyrics({
         songTitle: title,
         artistName: artist,
         youtubeId,
+        romanizedLyrics: scraped.romanizedLyrics,
         hindiLyrics: scraped.hindiLyrics,
-        englishTranslation: scraped.englishTranslation,
+        englishTranslation: englishTranslation,
         source: 'lyricsmint'
       });
     }
 
-    const segments = lyricsToSegments(scraped.hindiLyrics, durationSeconds);
+    const segments = lyricsToSegments(scraped.romanizedLyrics, englishTranslation, durationSeconds);
     return {
       found: true,
       segments,
-      source: 'lyricsmint',
-      hindiLyrics: scraped.hindiLyrics,
-      englishTranslation: scraped.englishTranslation
+      source: 'lyricsmint'
     };
   }
 
-  // 4. Not found - will use Groq fallback
+  // 4. If scraper found only Devanagari (needs transliteration), skip for now
+  if (scraped && scraped.needsTransliteration) {
+    console.log('[LYRICS] Only Devanagari found, needs transliteration - falling back to Groq');
+  }
+
+  // 5. Not found - will use Groq fallback
   console.log('[LYRICS] No lyrics found, will use Groq fallback');
   return {
     found: false,
@@ -228,11 +331,13 @@ async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
 
 /**
  * Save transcription to cache (called after Groq fallback succeeds)
+ * For Groq fallback, we only have English translation, not romanized Hindi
  * @param {string} youtubeUrl
  * @param {string} videoTitle
- * @param {string} transcript - The transcribed/translated text
+ * @param {string} transcript - The transcribed/translated text (English from Groq)
+ * @param {string} romanized - Optional romanized Hindi if available
  */
-async function saveTranscriptionToCache(youtubeUrl, videoTitle, transcript) {
+async function saveTranscriptionToCache(youtubeUrl, videoTitle, transcript, romanized = null) {
   const youtubeId = extractVideoId(youtubeUrl);
   if (!youtubeId) return;
 
@@ -242,8 +347,9 @@ async function saveTranscriptionToCache(youtubeUrl, videoTitle, transcript) {
     songTitle: title,
     artistName: artist,
     youtubeId,
-    hindiLyrics: transcript,
-    englishTranslation: null,
+    romanizedLyrics: romanized,
+    hindiLyrics: null,
+    englishTranslation: transcript,
     source: 'groq'
   });
 }
@@ -260,6 +366,8 @@ module.exports = {
   searchLyrics,
   parseVideoTitle,
   lyricsToSegments,
+  lyricsToSegmentsLegacy,
+  translateToEnglish,
   saveTranscriptionToCache,
   getCacheStats,
   extractVideoId

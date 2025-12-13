@@ -2,7 +2,7 @@
  * Lyrics Database Service
  *
  * Postgres-based lyrics cache for fast lookups.
- * Replaces the old JSON file cache.
+ * Stores romanized Hindi lyrics and English translations.
  */
 
 const { Pool } = require('pg');
@@ -16,6 +16,31 @@ if (USE_POSTGRES) {
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
   });
+}
+
+/**
+ * Initialize the database schema (add new columns if needed)
+ * Called on startup
+ */
+async function initSchema() {
+  if (!USE_POSTGRES) return;
+
+  try {
+    // Add romanized_lyrics column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE song_lyrics
+      ADD COLUMN IF NOT EXISTS romanized_lyrics TEXT
+    `);
+    console.log('[LYRICS_DB] Schema updated: romanized_lyrics column ready');
+  } catch (error) {
+    // Column might already exist or table doesn't exist yet
+    console.log('[LYRICS_DB] Schema check:', error.message);
+  }
+}
+
+// Initialize schema on module load
+if (USE_POSTGRES) {
+  initSchema().catch(err => console.error('[LYRICS_DB] Init error:', err.message));
 }
 
 /**
@@ -102,26 +127,38 @@ async function searchByTitleArtist(title, artist) {
 
 /**
  * Save lyrics to the database cache
+ * Now supports romanized_lyrics column
  * @param {Object} params
  * @returns {Promise<boolean>}
  */
-async function saveLyrics({ songTitle, artistName, youtubeId, hindiLyrics, englishTranslation, source }) {
+async function saveLyrics({ songTitle, artistName, youtubeId, romanizedLyrics, hindiLyrics, englishTranslation, source }) {
   if (!USE_POSTGRES) return false;
 
   try {
     // Upsert - insert or update if youtube_id exists
+    // Support both old (hindi_lyrics) and new (romanized_lyrics) schemas
     await pool.query(`
-      INSERT INTO song_lyrics (song_title, artist_name, youtube_id, hindi_lyrics, english_translation, source, updated_at)
-      VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+      INSERT INTO song_lyrics (
+        song_title,
+        artist_name,
+        youtube_id,
+        romanized_lyrics,
+        hindi_lyrics,
+        english_translation,
+        source,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
       ON CONFLICT (youtube_id)
       DO UPDATE SET
         song_title = EXCLUDED.song_title,
         artist_name = EXCLUDED.artist_name,
+        romanized_lyrics = EXCLUDED.romanized_lyrics,
         hindi_lyrics = EXCLUDED.hindi_lyrics,
         english_translation = EXCLUDED.english_translation,
         source = EXCLUDED.source,
         updated_at = CURRENT_TIMESTAMP
-    `, [songTitle, artistName, youtubeId, hindiLyrics, englishTranslation, source]);
+    `, [songTitle, artistName, youtubeId, romanizedLyrics, hindiLyrics, englishTranslation, source]);
 
     console.log(`[LYRICS_DB] Saved: "${songTitle}" (source: ${source})`);
     return true;
@@ -159,7 +196,7 @@ async function flagAsIncorrect(youtubeId) {
  */
 async function getStats() {
   if (!USE_POSTGRES) {
-    return { total: 0, bySource: {} };
+    return { total: 0, bySource: {}, withRomanized: 0 };
   }
 
   try {
@@ -170,17 +207,22 @@ async function getStats() {
       WHERE confidence > 0
       GROUP BY source
     `);
+    const withRomanized = await pool.query(`
+      SELECT COUNT(*) FROM song_lyrics
+      WHERE confidence > 0 AND romanized_lyrics IS NOT NULL
+    `);
 
     return {
       total: parseInt(total.rows[0].count),
       bySource: bySource.rows.reduce((acc, row) => {
         acc[row.source] = parseInt(row.count);
         return acc;
-      }, {})
+      }, {}),
+      withRomanized: parseInt(withRomanized.rows[0].count)
     };
   } catch (error) {
     console.error('[LYRICS_DB] Stats error:', error.message);
-    return { total: 0, bySource: {} };
+    return { total: 0, bySource: {}, withRomanized: 0 };
   }
 }
 
@@ -189,5 +231,6 @@ module.exports = {
   searchByTitleArtist,
   saveLyrics,
   flagAsIncorrect,
-  getStats
+  getStats,
+  initSchema
 };

@@ -1,6 +1,7 @@
 /**
  * LyricsMint Scraper
  * Searches and scrapes lyrics from lyricsmint.com
+ * Extracts romanized Hindi lyrics (Hindi written in English letters)
  */
 
 const cheerio = require('cheerio');
@@ -56,7 +57,6 @@ async function searchLyricsMint(songTitle, artistName) {
     const $ = cheerio.load(html);
 
     // LyricsMint search results are usually in article tags or entry-title links
-    // Look for the first lyrics link
     const selectors = [
       'article a[href*="lyricsmint.com"]',
       '.entry-title a',
@@ -71,7 +71,6 @@ async function searchLyricsMint(songTitle, artistName) {
       const link = $(selector).first();
       if (link.length > 0) {
         const href = link.attr('href');
-        // Make sure it's a lyrics page, not a category/tag page
         if (href && href.includes('lyricsmint.com') && !href.includes('/tag/') && !href.includes('/category/')) {
           lyricsPageUrl = href;
           break;
@@ -84,7 +83,6 @@ async function searchLyricsMint(songTitle, artistName) {
       $('a').each((i, el) => {
         const href = $(el).attr('href');
         if (href && href.includes('lyricsmint.com/') && href.split('/').length >= 5) {
-          // URL like lyricsmint.com/artist/song has 5+ parts when split
           lyricsPageUrl = href;
           return false; // break
         }
@@ -106,7 +104,59 @@ async function searchLyricsMint(songTitle, artistName) {
 }
 
 /**
+ * Clean HTML to plain text lyrics
+ */
+function cleanLyricsHtml(html) {
+  let text = html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#?[a-z0-9]+;/gi, '')
+    .trim();
+
+  // Clean up whitespace
+  text = text
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .join('\n');
+
+  // Remove metadata lines
+  const removePatterns = [
+    /^lyrics\s*$/im,
+    /^song\s*:?\s*$/im,
+    /^singer\s*:/im,
+    /^music\s*:/im,
+    /^composer\s*:/im,
+    /^lyricist\s*:/im,
+    /^movie\s*:/im,
+    /^album\s*:/im,
+    /^label\s*:/im,
+    /^starring\s*:/im,
+    /^director\s*:/im,
+    /^share this/im,
+    /^copyright/im,
+    /^all rights reserved/im,
+    /^\[.*\]$/m
+  ];
+
+  let lines = text.split('\n');
+  lines = lines.filter(line => {
+    const trimmed = line.trim();
+    return !removePatterns.some(pattern => pattern.test(trimmed));
+  });
+
+  return lines.join('\n').trim();
+}
+
+/**
  * Scrape lyrics from a LyricsMint lyrics page
+ * Returns romanized Hindi (Hindi written in English letters)
  */
 async function scrapeLyricsPage(pageUrl) {
   try {
@@ -123,91 +173,121 @@ async function scrapeLyricsPage(pageUrl) {
     // Remove script and style tags
     $('script, style, noscript').remove();
 
-    // LyricsMint puts lyrics in various containers
-    // Try multiple selectors
-    const lyricsSelectors = [
-      '.entry-content',
-      '.lyrics-content',
-      '.song-lyrics',
-      '.lyrics',
-      'article .content',
-      '.post-content'
-    ];
+    let hindiLyrics = '';      // Devanagari: तुम ही हो
+    let romanizedLyrics = '';  // Romanized: Tum hi ho
 
-    let lyricsHtml = '';
+    // Method 1: Look for explicit Hindi/English sections by headers
+    const content = $('.entry-content').html() || '';
 
-    for (const selector of lyricsSelectors) {
-      const container = $(selector).first();
-      if (container.length > 0) {
-        // Get the HTML and process it
-        lyricsHtml = container.html();
-        if (lyricsHtml && lyricsHtml.length > 200) {
-          break;
+    // Try to find labeled sections
+    const englishMatch = content.match(/english\s*lyrics[:\s]*([\s\S]*?)(?=hindi\s*lyrics|$)/i);
+    const hindiMatch = content.match(/hindi\s*lyrics[:\s]*([\s\S]*?)(?=english\s*lyrics|$)/i);
+
+    if (englishMatch) {
+      romanizedLyrics = cleanLyricsHtml(englishMatch[1]);
+    }
+    if (hindiMatch) {
+      hindiLyrics = cleanLyricsHtml(hindiMatch[1]);
+    }
+
+    // Method 2: If no labeled sections, analyze the content
+    if (!romanizedLyrics && !hindiLyrics) {
+      const lyricsSelectors = [
+        '.entry-content',
+        '.lyrics-content',
+        '.song-lyrics',
+        '.lyrics',
+        'article .content',
+        '.post-content'
+      ];
+
+      let lyricsHtml = '';
+      for (const selector of lyricsSelectors) {
+        const container = $(selector).first();
+        if (container.length > 0) {
+          lyricsHtml = container.html();
+          if (lyricsHtml && lyricsHtml.length > 200) {
+            break;
+          }
+        }
+      }
+
+      if (lyricsHtml) {
+        const cleanedText = cleanLyricsHtml(lyricsHtml);
+
+        // Separate Devanagari and romanized lines
+        const lines = cleanedText.split('\n');
+        const devanagariLines = [];
+        const romanLines = [];
+
+        lines.forEach(line => {
+          const trimmed = line.trim();
+          if (!trimmed) return;
+
+          // Check if line contains Devanagari characters
+          const hasDevanagari = /[\u0900-\u097F]/.test(trimmed);
+
+          if (hasDevanagari) {
+            devanagariLines.push(trimmed);
+          } else if (/[a-zA-Z]/.test(trimmed)) {
+            // Line has Latin characters - likely romanized Hindi
+            romanLines.push(trimmed);
+          }
+        });
+
+        // If we found both types, use them
+        if (devanagariLines.length > 0 && romanLines.length > 0) {
+          hindiLyrics = devanagariLines.join('\n');
+          romanizedLyrics = romanLines.join('\n');
+        } else if (romanLines.length > 0) {
+          // Only romanized found
+          romanizedLyrics = romanLines.join('\n');
+        } else if (devanagariLines.length > 0) {
+          // Only Devanagari found
+          hindiLyrics = devanagariLines.join('\n');
+        } else {
+          // Mixed or unclear - assume it's romanized if mostly Latin
+          const hasLatin = /[a-zA-Z]/.test(cleanedText);
+          if (hasLatin) {
+            romanizedLyrics = cleanedText;
+          } else {
+            hindiLyrics = cleanedText;
+          }
         }
       }
     }
 
-    if (!lyricsHtml || lyricsHtml.length < 200) {
-      console.log('[LYRICSMINT] Could not find lyrics container');
+    // We prefer romanized lyrics for display
+    if (!romanizedLyrics && !hindiLyrics) {
+      console.log('[LYRICSMINT] Could not extract lyrics');
       return null;
     }
 
-    // Convert HTML to text, preserving line breaks
-    // Replace <br> and </p> with newlines
-    let lyrics = lyricsHtml
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/<\/p>/gi, '\n\n')
-      .replace(/<\/div>/gi, '\n')
-      .replace(/<[^>]+>/g, '') // Remove remaining HTML tags
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&amp;/g, '&')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&#?[a-z0-9]+;/gi, '') // Remove other HTML entities
-      .trim();
+    // If we only have Devanagari, we can't display romanized
+    if (!romanizedLyrics && hindiLyrics) {
+      console.log('[LYRICSMINT] Only found Devanagari, no romanized version');
+      return {
+        hindiLyrics: hindiLyrics,
+        romanizedLyrics: null,
+        needsTransliteration: true
+      };
+    }
 
-    // Clean up excessive whitespace
-    lyrics = lyrics
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-      .join('\n');
-
-    // Remove common non-lyrics content
-    const removePatterns = [
-      /^lyrics\s*$/im,
-      /^song\s*$/im,
-      /^singer[:\s]/im,
-      /^music[:\s]/im,
-      /^composer[:\s]/im,
-      /^lyricist[:\s]/im,
-      /^movie[:\s]/im,
-      /^album[:\s]/im,
-      /^label[:\s]/im,
-      /^share this/im,
-      /^copyright/im,
-      /^all rights reserved/im,
-      /^\[.*\]$/m
-    ];
-
-    let lines = lyrics.split('\n');
-    lines = lines.filter(line => {
-      const trimmed = line.trim();
-      return !removePatterns.some(pattern => pattern.test(trimmed));
-    });
-
-    lyrics = lines.join('\n').trim();
-
-    if (lyrics.length < 100) {
-      console.log('[LYRICSMINT] Extracted lyrics too short, probably not actual lyrics');
+    // Validate we have enough content
+    if (romanizedLyrics && romanizedLyrics.length < 50) {
+      console.log('[LYRICSMINT] Romanized lyrics too short');
       return null;
     }
 
-    console.log(`[LYRICSMINT] Extracted ${lyrics.length} chars of lyrics`);
+    console.log(`[LYRICSMINT] Found romanized: ${romanizedLyrics?.length || 0} chars`);
+    if (hindiLyrics) {
+      console.log(`[LYRICSMINT] Found Devanagari: ${hindiLyrics.length} chars`);
+    }
 
     return {
-      hindiLyrics: lyrics,
-      englishTranslation: null // LyricsMint sometimes has translations, but parsing is complex
+      hindiLyrics: hindiLyrics || null,
+      romanizedLyrics: romanizedLyrics,
+      needsTransliteration: false
     };
 
   } catch (error) {
@@ -236,9 +316,17 @@ async function fetchLyrics(songTitle, artistName) {
   }
 
   // Scrape the lyrics page
-  const lyrics = await scrapeLyricsPage(pageUrl);
+  const result = await scrapeLyricsPage(pageUrl);
 
-  return lyrics;
+  if (!result) {
+    return null;
+  }
+
+  return {
+    romanizedLyrics: result.romanizedLyrics,
+    hindiLyrics: result.hindiLyrics,
+    needsTransliteration: result.needsTransliteration || false
+  };
 }
 
 module.exports = { fetchLyrics, searchLyricsMint, scrapeLyricsPage };

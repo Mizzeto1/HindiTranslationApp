@@ -113,9 +113,19 @@ router.post('/search-songs', async (req, res) => {
 
     // Search YouTube (adds "song" to query for better Bollywood results)
     const searchQuery = `${query} hindi song`;
-    const results = await youtubeService.searchYouTube(searchQuery, 5);
 
-    if (results.length === 0) {
+    let results;
+    try {
+      results = await youtubeService.searchYouTube(searchQuery, 5);
+    } catch (searchError) {
+      console.error('[SEARCH] YouTube search error:', searchError.message);
+      return res.status(500).json({
+        error: 'YouTube search failed',
+        message: 'Could not search YouTube. Please try pasting a URL directly.'
+      });
+    }
+
+    if (!results || results.length === 0) {
       return res.json({
         selected: null,
         alternatives: [],
@@ -123,17 +133,29 @@ router.post('/search-songs', async (req, res) => {
       });
     }
 
-    // Check which results have cached lyrics
-    const resultsWithLyricsInfo = await Promise.all(
-      results.map(async (result) => {
-        const cached = await lyricsDb.getByYoutubeId(result.youtubeId);
-        return {
-          ...result,
-          hasLyrics: !!cached,
-          lyricsSource: cached?.source || null
-        };
-      })
-    );
+    // Check which results have cached lyrics (but don't fail if DB is unavailable)
+    let resultsWithLyricsInfo;
+    try {
+      resultsWithLyricsInfo = await Promise.all(
+        results.map(async (result) => {
+          try {
+            const cached = await lyricsDb.getByYoutubeId(result.youtubeId);
+            return {
+              ...result,
+              hasLyrics: !!cached,
+              lyricsSource: cached?.source || null
+            };
+          } catch (dbError) {
+            // If DB check fails, just return result without lyrics info
+            return { ...result, hasLyrics: false, lyricsSource: null };
+          }
+        })
+      );
+    } catch (dbError) {
+      console.error('[SEARCH] Lyrics DB check failed:', dbError.message);
+      // Continue without lyrics info
+      resultsWithLyricsInfo = results.map(r => ({ ...r, hasLyrics: false, lyricsSource: null }));
+    }
 
     // Auto-select: prefer one with cached lyrics, else first result
     const withLyrics = resultsWithLyricsInfo.find(r => r.hasLyrics);
@@ -147,7 +169,7 @@ router.post('/search-songs', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('[SEARCH] Error:', error.message);
+    console.error('[SEARCH] Unexpected error:', error.message, error.stack);
     res.status(500).json({
       error: 'Search failed',
       message: error.message

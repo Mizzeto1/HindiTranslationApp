@@ -279,10 +279,113 @@ async function getVideoMetadata(youtubeUrl) {
   }
 }
 
+/**
+ * Search YouTube using the Data API (if key provided) or yt-dlp fallback
+ * @param {string} query - Search query
+ * @param {number} maxResults - Maximum results to return (default 5)
+ * @returns {Promise<Array>} Array of video results
+ */
+async function searchYouTube(query, maxResults = 5) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+
+  if (apiKey) {
+    try {
+      return await searchWithApi(query, maxResults, apiKey);
+    } catch (error) {
+      console.log('[YOUTUBE] API search failed, falling back to yt-dlp:', error.message);
+    }
+  }
+
+  // Fallback to yt-dlp search
+  return await searchWithYtDlp(query, maxResults);
+}
+
+/**
+ * Search YouTube using the Data API v3
+ */
+async function searchWithApi(query, maxResults, apiKey) {
+  console.log(`[YOUTUBE] Searching with API: "${query}"`);
+
+  const url = new URL('https://www.googleapis.com/youtube/v3/search');
+  url.searchParams.set('part', 'snippet');
+  url.searchParams.set('type', 'video');
+  url.searchParams.set('videoCategoryId', '10'); // Music category
+  url.searchParams.set('q', query);
+  url.searchParams.set('maxResults', maxResults.toString());
+  url.searchParams.set('key', apiKey);
+
+  const response = await fetch(url.toString());
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`YouTube API error: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+
+  if (!data.items || data.items.length === 0) {
+    console.log('[YOUTUBE] No results from API');
+    return [];
+  }
+
+  const results = data.items.map(item => ({
+    youtubeId: item.id.videoId,
+    title: item.snippet.title,
+    channel: item.snippet.channelTitle,
+    thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url,
+    publishedAt: item.snippet.publishedAt
+  }));
+
+  console.log(`[YOUTUBE] API returned ${results.length} results`);
+  return results;
+}
+
+/**
+ * Search YouTube using yt-dlp (no API key needed, but slower)
+ */
+async function searchWithYtDlp(query, maxResults) {
+  const ytdlp = getYtDlpPath();
+  console.log(`[YOUTUBE] Searching with yt-dlp: "${query}"`);
+
+  try {
+    const { stdout } = await execPromise(
+      `"${ytdlp}" "ytsearch${maxResults}:${query}" --dump-json --flat-playlist --no-warnings`,
+      { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
+    );
+
+    // yt-dlp outputs one JSON object per line
+    const lines = stdout.trim().split('\n').filter(line => line.trim());
+    const results = [];
+
+    for (const line of lines) {
+      try {
+        const item = JSON.parse(line);
+        results.push({
+          youtubeId: item.id,
+          title: item.title,
+          channel: item.channel || item.uploader || '',
+          thumbnail: item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${item.id}/mqdefault.jpg`,
+          publishedAt: null
+        });
+      } catch (parseError) {
+        // Skip malformed lines
+      }
+    }
+
+    console.log(`[YOUTUBE] yt-dlp returned ${results.length} results`);
+    return results;
+
+  } catch (error) {
+    console.error('[YOUTUBE] yt-dlp search error:', error.message);
+    return [];
+  }
+}
+
 module.exports = {
   checkYtDlpInstalled,
   getVideoDuration,
   downloadAudio,
   cleanupAudioFile,
-  getVideoMetadata
+  getVideoMetadata,
+  searchYouTube
 };

@@ -22,6 +22,9 @@ const fs = require('fs').promises;
 // Also handles: m.youtube.com, music.youtube.com, and URLs with extra parameters (&list=, &t=, etc.)
 const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com\/(watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)[a-zA-Z0-9_-]{11}/;
 
+// Import lyricsDb for checking cached lyrics
+const lyricsDb = require('../services/lyricsDb');
+
 /**
  * Extract and clean YouTube URL to get just the video
  * Removes playlist params, tracking params, etc.
@@ -91,24 +94,92 @@ function extractVideoId(url) {
 }
 
 /**
+ * POST /api/search-songs
+ * Search for Hindi/Bollywood songs on YouTube
+ * Public endpoint (no auth required for search)
+ */
+router.post('/search-songs', async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query || query.length < 2) {
+      return res.status(400).json({
+        error: 'Invalid query',
+        message: 'Search query must be at least 2 characters'
+      });
+    }
+
+    console.log(`[SEARCH] Searching for: "${query}"`);
+
+    // Search YouTube (adds "song" to query for better Bollywood results)
+    const searchQuery = `${query} hindi song`;
+    const results = await youtubeService.searchYouTube(searchQuery, 5);
+
+    if (results.length === 0) {
+      return res.json({
+        selected: null,
+        alternatives: [],
+        message: 'No results found'
+      });
+    }
+
+    // Check which results have cached lyrics
+    const resultsWithLyricsInfo = await Promise.all(
+      results.map(async (result) => {
+        const cached = await lyricsDb.getByYoutubeId(result.youtubeId);
+        return {
+          ...result,
+          hasLyrics: !!cached,
+          lyricsSource: cached?.source || null
+        };
+      })
+    );
+
+    // Auto-select: prefer one with cached lyrics, else first result
+    const withLyrics = resultsWithLyricsInfo.find(r => r.hasLyrics);
+    const selected = withLyrics || resultsWithLyricsInfo[0];
+
+    console.log(`[SEARCH] Found ${results.length} results, selected: ${selected.title}`);
+
+    res.json({
+      selected,
+      alternatives: resultsWithLyricsInfo.filter(r => r.youtubeId !== selected.youtubeId)
+    });
+
+  } catch (error) {
+    console.error('[SEARCH] Error:', error.message);
+    res.status(500).json({
+      error: 'Search failed',
+      message: error.message
+    });
+  }
+});
+
+/**
  * POST /api/translate
  * Start a new translation job
  * Protected: Requires Clerk authentication
  */
 router.post('/translate', requireAuth, async (req, res) => {
   try {
-    const { youtubeUrl: rawUrl } = req.body;
+    let { youtubeUrl: rawUrl, youtubeId } = req.body;
     const userId = req.userId;
 
     console.log(`[TRANSLATE] Request from user: ${userId}`);
 
-    // Validate request body
-    if (!rawUrl) {
-      console.log('[TRANSLATE] Error: No YouTube URL provided');
+    // Accept either youtubeUrl or youtubeId
+    if (!rawUrl && !youtubeId) {
+      console.log('[TRANSLATE] Error: No YouTube URL or ID provided');
       return res.status(400).json({
         error: 'Missing required field',
-        message: 'youtubeUrl is required'
+        message: 'Either youtubeUrl or youtubeId is required'
       });
+    }
+
+    // If youtubeId provided, construct URL
+    if (youtubeId && !rawUrl) {
+      rawUrl = `https://www.youtube.com/watch?v=${youtubeId}`;
+      console.log(`[TRANSLATE] Constructed URL from ID: ${rawUrl}`);
     }
 
     // Try to extract video ID to validate it's a YouTube URL
@@ -117,7 +188,7 @@ router.post('/translate', requireAuth, async (req, res) => {
       console.log(`[TRANSLATE] Error: Could not extract video ID from: ${rawUrl}`);
       return res.status(400).json({
         error: 'Invalid URL',
-        message: 'Please provide a valid YouTube URL'
+        message: 'Please provide a valid YouTube URL or ID'
       });
     }
 

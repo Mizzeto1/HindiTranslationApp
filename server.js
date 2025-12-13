@@ -83,6 +83,8 @@ app.get('/', (req, res) => {
       'Stripe subscription management'
     ],
     endpoints: {
+      // Search (no auth required)
+      search_songs: 'POST /api/search-songs',
       // Translation (requires auth)
       translate: 'POST /api/translate',
       status: 'GET /api/status/:jobId',

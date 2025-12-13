@@ -37,6 +37,7 @@ async function initDatabase() {
   }
 
   try {
+    // Users table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         user_id VARCHAR(255) PRIMARY KEY,
@@ -49,6 +50,30 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Song lyrics cache table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS song_lyrics (
+        id SERIAL PRIMARY KEY,
+        song_title VARCHAR(255),
+        artist_name VARCHAR(255),
+        youtube_id VARCHAR(50),
+        hindi_lyrics TEXT,
+        english_translation TEXT,
+        source VARCHAR(50) DEFAULT 'lyricsmint',
+        confidence INTEGER DEFAULT 100,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(youtube_id)
+      )
+    `);
+
+    // Full-text search index for song lookup
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_lyrics_search
+      ON song_lyrics USING GIN (to_tsvector('simple', song_title || ' ' || COALESCE(artist_name, '')))
+    `);
+
     console.log('[USER_STORAGE] PostgreSQL database initialized');
   } catch (error) {
     console.error('[USER_STORAGE] Database init error:', error.message);

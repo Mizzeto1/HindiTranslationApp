@@ -108,10 +108,12 @@ function parseVideoTitle(videoTitle) {
 
 /**
  * Translate romanized Hindi lyrics to actual English
+ * Uses few-shot prompting for better quality
  * @param {string} romanizedLyrics - Hindi lyrics in English letters (e.g., "Tum hi ho")
+ * @param {object} options - Optional context { songTitle, artistName }
  * @returns {Promise<string|null>} - Actual English translation
  */
-async function translateToEnglish(romanizedLyrics) {
+async function translateToEnglish(romanizedLyrics, options = {}) {
   if (!romanizedLyrics || romanizedLyrics.length < 10) {
     return null;
   }
@@ -121,36 +123,91 @@ async function translateToEnglish(romanizedLyrics) {
     return null;
   }
 
+  const { songTitle = '', artistName = '' } = options;
+
+  // Build context string
+  let contextInfo = 'a Hindi/Punjabi Bollywood song';
+  if (songTitle) {
+    contextInfo = `the song "${songTitle}"`;
+    if (artistName) {
+      contextInfo += ` by ${artistName}`;
+    }
+  }
+
+  const systemPrompt = `You are an expert translator specializing in Hindi/Punjabi Bollywood song lyrics.
+
+CONTEXT: You are translating ${contextInfo}. This is sung poetry, not spoken conversation.
+
+YOUR TASK:
+1. First, silently fix any obvious transcription errors in the romanized Hindi
+2. Then translate each line to natural, poetic English
+3. Preserve the emotional meaning, not just literal words
+
+CRITICAL RULES:
+- Make it sound natural and poetic in English, not awkward word-for-word translation
+- Preserve repeated lines (they're intentional in songs)
+- "Tum/Tujhe/Teri/Meri" = intimate forms (like speaking to a beloved)
+- Keep the same number of lines as the input
+- Output ONLY the English translation, nothing else
+
+EXAMPLES OF GOOD TRANSLATION:
+
+Romanized: Tum hi ho, bas tum hi ho
+English: You're the only one, just you
+
+Romanized: Zindagi ab tum hi ho, chain bhi mera dard bhi
+English: You are my life now, my peace and my pain too
+
+Romanized: Dil to pagal hai, dil deewana hai
+English: This heart is crazy, this heart is mad in love
+
+Romanized: Teri ore teri ore hai rabba, dil mera bhi jaane na kyun
+English: Towards you, towards you my heart goes, even I don't know why
+
+Romanized: Haay tere ni kararan mainu patteya
+English: Oh, your promises have caught hold of me
+
+AVOID:
+- Awkward literal translations like "You only are" or "Heart is then crazy"
+- Leaving Hindi words untranslated (unless they're names)
+- Adding notes, explanations, or [brackets]
+- Changing the number of lines`;
+
   try {
     console.log('[LYRICS] Translating romanized Hindi to English...');
+    console.log('[LYRICS] Context:', contextInfo);
+    console.log('[LYRICS] Input length:', romanizedLyrics.length, 'chars');
 
     const response = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
         {
           role: 'system',
-          content: `You are a Hindi to English translator specializing in Bollywood song lyrics.
-
-Your task:
-- Translate the romanized Hindi lyrics to natural English
-- Keep the SAME number of lines as the input
-- Each output line should be the translation of the corresponding input line
-- Capture the poetic meaning, not just literal translation
-- Output ONLY the English translation, no explanations or notes
-- Do not include line numbers or any other formatting
-- If a line is a repetition (like "Tum hi ho, tum hi ho"), translate it as repetition too`
+          content: systemPrompt
         },
         {
           role: 'user',
-          content: romanizedLyrics
+          content: `Translate these lyrics:\n\n${romanizedLyrics}`
         }
       ],
-      temperature: 0.3,
-      max_tokens: 4000
+      temperature: 0.2,  // Low temperature for consistency
+      max_tokens: 4000,
+      top_p: 0.9
     });
 
     const translation = response.choices[0].message.content.trim();
-    console.log(`[LYRICS] Translation complete: ${translation.length} chars`);
+
+    // Validate output
+    const inputLines = romanizedLyrics.split('\n').filter(l => l.trim()).length;
+    const outputLines = translation.split('\n').filter(l => l.trim()).length;
+
+    console.log('[LYRICS] Translation complete:', translation.length, 'chars');
+    console.log('[LYRICS] Input lines:', inputLines, 'Output lines:', outputLines);
+
+    // If line count is very different, log a warning
+    if (outputLines < inputLines * 0.5) {
+      console.log('[LYRICS] Warning: Output has significantly fewer lines than input');
+    }
 
     return translation;
 
@@ -282,8 +339,11 @@ async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
   if (scraped && scraped.romanizedLyrics) {
     console.log(`[LYRICS] Found romanized lyrics on LyricsMint (${scraped.romanizedLyrics.length} chars)`);
 
-    // Translate romanized Hindi to actual English
-    const englishTranslation = await translateToEnglish(scraped.romanizedLyrics);
+    // Translate romanized Hindi to actual English (with song context for better quality)
+    const englishTranslation = await translateToEnglish(scraped.romanizedLyrics, {
+      songTitle: title,
+      artistName: artist
+    });
 
     if (!englishTranslation) {
       console.log('[LYRICS] Translation failed, falling back to Groq audio transcription');

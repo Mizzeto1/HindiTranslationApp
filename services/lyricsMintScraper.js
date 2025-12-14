@@ -246,168 +246,169 @@ async function scrapeLyricsPage(pageUrl) {
     console.log('[LYRICSMINT] Page HTML length:', html.length);
 
     // Remove unwanted elements
-    $('script, style, noscript, nav, header, footer, .sidebar, .comments, .related-posts, .share-buttons, .ad, .advertisement, .social-share').remove();
+    $('script, style, noscript, nav, header, footer, .sidebar, .comments, .share-buttons, .ad').remove();
 
     let romanizedLyrics = '';
     let hindiLyrics = '';
 
-    // Method 1: Look for lyrics in pre-formatted blocks
-    $('pre').each((i, el) => {
-      const text = $(el).text().trim();
-      if (text.length > 100) {
-        const hasDevanagari = /[\u0900-\u097F]/.test(text);
-        if (hasDevanagari && !hindiLyrics) {
-          hindiLyrics = text;
-          console.log('[LYRICSMINT] Found Hindi in <pre>:', text.length, 'chars');
-        } else if (!hasDevanagari && !romanizedLyrics) {
-          romanizedLyrics = text;
-          console.log('[LYRICSMINT] Found romanized in <pre>:', text.length, 'chars');
-        }
-      }
-    });
+    // PRIMARY METHOD: LyricsMint uses tabs.panel for lyrics content
+    const lyricsPanel = $('div[data-target="tabs.panel"]').first();
 
-    // Method 2: Look for common lyrics container classes
-    const lyricsSelectors = [
-      '.lyrics', '.lyrics-body', '.lyrics-text', '.song-lyrics',
-      '.entry-content .su-column', '.entry-content .wp-block-column',
-      '[class*="lyrics"]', '[id*="lyrics"]'
-    ];
+    if (lyricsPanel.length) {
+      console.log('[LYRICSMINT] Found tabs.panel container');
 
-    for (const selector of lyricsSelectors) {
-      if (romanizedLyrics && hindiLyrics) break;
+      // Get the text container inside
+      const textContainer = lyricsPanel.find('div.text-base, div[class*="text-base"]').first();
 
-      $(selector).each((i, el) => {
-        const elHtml = $(el).html();
-        if (!elHtml) return;
+      if (textContainer.length) {
+        console.log('[LYRICSMINT] Found text-base container');
 
-        const text = cleanLyricsHtml(elHtml);
-        if (text.length < 100) return;
+        // Get all paragraphs and extract text
+        const paragraphs = textContainer.find('p');
+        const lines = [];
 
-        const hasDevanagari = /[\u0900-\u097F]/.test(text);
-        if (hasDevanagari && !hindiLyrics) {
-          hindiLyrics = text;
-          console.log(`[LYRICSMINT] Found Hindi via ${selector}:`, text.length, 'chars');
-        } else if (!hasDevanagari && !romanizedLyrics) {
-          romanizedLyrics = text;
-          console.log(`[LYRICSMINT] Found romanized via ${selector}:`, text.length, 'chars');
-        }
-      });
-    }
+        paragraphs.each((i, p) => {
+          // Get HTML and convert <br> to newlines
+          const pHtml = $(p).html() || '';
+          const pText = pHtml
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<[^>]+>/g, '')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&amp;/g, '&')
+            .replace(/[""]|&ldquo;|&rdquo;/g, '"')
+            .replace(/['']|&lsquo;|&rsquo;/g, "'")
+            .trim();
 
-    // Method 3: LyricsMint often uses columns - look for side-by-side Hindi/English
-    $('.su-row .su-column, .wp-block-columns .wp-block-column, .row .col, .columns .column').each((i, el) => {
-      const elHtml = $(el).html();
-      if (!elHtml) return;
-
-      const text = cleanLyricsHtml(elHtml);
-      if (text.length < 100) return;
-
-      const hasDevanagari = /[\u0900-\u097F]/.test(text);
-      if (hasDevanagari && !hindiLyrics) {
-        hindiLyrics = text;
-        console.log('[LYRICSMINT] Found Hindi in column:', text.length, 'chars');
-      } else if (!hasDevanagari && !romanizedLyrics) {
-        romanizedLyrics = text;
-        console.log('[LYRICSMINT] Found romanized in column:', text.length, 'chars');
-      }
-    });
-
-    // Method 4: Get all paragraphs in entry-content and look for lyrics patterns
-    if (!romanizedLyrics || !hindiLyrics) {
-      const content = $('.entry-content, .post-content, article .content, main').first();
-
-      if (content.length) {
-        // Get all text blocks that contain line breaks (lyrics have many short lines)
-        const blocks = [];
-
-        content.find('p, div').each((i, el) => {
-          const elHtml = $(el).html() || '';
-          // Skip if it's a container with children we already processed
-          if ($(el).children('p, div').length > 2) return;
-
-          const text = cleanLyricsHtml(elHtml);
-          // Lyrics typically have multiple lines
-          const lineCount = text.split('\n').filter(l => l.trim()).length;
-
-          if (text.length > 100 && lineCount >= 4) {
-            blocks.push({ text, hasDevanagari: /[\u0900-\u097F]/.test(text) });
+          if (pText.length > 0) {
+            lines.push(pText);
           }
         });
 
-        // Sort by length (longer = more likely to be full lyrics)
-        blocks.sort((a, b) => b.text.length - a.text.length);
+        const extractedText = lines.join('\n\n');
+        console.log('[LYRICSMINT] Extracted from tabs.panel:', extractedText.length, 'chars');
 
-        for (const block of blocks) {
-          if (block.hasDevanagari && !hindiLyrics) {
-            hindiLyrics = block.text;
-            console.log('[LYRICSMINT] Found Hindi in content block:', block.text.length, 'chars');
-          } else if (!block.hasDevanagari && !romanizedLyrics) {
-            romanizedLyrics = block.text;
-            console.log('[LYRICSMINT] Found romanized in content block:', block.text.length, 'chars');
-          }
+        // Check if it's Devanagari or Romanized
+        const hasDevanagari = /[\u0900-\u097F]/.test(extractedText);
 
-          if (romanizedLyrics && hindiLyrics) break;
+        if (hasDevanagari) {
+          hindiLyrics = extractedText;
+        } else {
+          romanizedLyrics = extractedText;
         }
       }
     }
 
-    // Method 5: Last resort - get ALL text from entry-content and split by script type
+    // If tabs.panel didn't work, try other methods
     if (!romanizedLyrics && !hindiLyrics) {
-      const content = $('.entry-content').first();
-      const fullHtml = content.html() || '';
-      const fullText = cleanLyricsHtml(fullHtml);
+      console.log('[LYRICSMINT] tabs.panel method failed, trying alternatives...');
 
-      if (fullText.length > 200) {
-        // Split lines by script
-        const lines = fullText.split('\n');
-        const hindiLines = [];
-        const romanLines = [];
+      // Method 2: Look for entry-content with multiple <p> tags containing <br>
+      const entryContent = $('.entry-content').first();
 
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed.length < 3) continue;
+      if (entryContent.length) {
+        const paragraphs = entryContent.find('p');
+        const lyricsLines = [];
 
-          // Skip metadata
-          if (/^(singer|music|lyrics|movie|album|label|composer|director|starring)[:\s]/i.test(trimmed)) continue;
+        paragraphs.each((i, p) => {
+          const pHtml = $(p).html() || '';
 
-          const hasDevanagari = /[\u0900-\u097F]/.test(trimmed);
-          if (hasDevanagari) {
-            hindiLines.push(trimmed);
-          } else if (/^[a-zA-Z]/.test(trimmed)) {
-            romanLines.push(trimmed);
+          // Lyrics paragraphs typically have <br> tags
+          if (pHtml.includes('<br')) {
+            const pText = pHtml
+              .replace(/<br\s*\/?>/gi, '\n')
+              .replace(/<[^>]+>/g, '')
+              .replace(/&nbsp;/g, ' ')
+              .replace(/&amp;/g, '&')
+              .replace(/[""]|&ldquo;|&rdquo;/g, '"')
+              .replace(/['']|&lsquo;|&rsquo;/g, "'")
+              .trim();
+
+            // Skip metadata paragraphs
+            if (pText.length > 20 && !/^(singer|music|lyrics|movie|album)[:\s]/i.test(pText)) {
+              lyricsLines.push(pText);
+            }
           }
-        }
+        });
 
-        if (hindiLines.length > 5) {
-          hindiLyrics = hindiLines.join('\n');
-          console.log('[LYRICSMINT] Extracted Hindi lines:', hindiLyrics.length, 'chars');
-        }
-        if (romanLines.length > 5) {
-          romanizedLyrics = romanLines.join('\n');
-          console.log('[LYRICSMINT] Extracted romanized lines:', romanizedLyrics.length, 'chars');
+        if (lyricsLines.length > 0) {
+          const extractedText = lyricsLines.join('\n\n');
+          console.log('[LYRICSMINT] Extracted from entry-content:', extractedText.length, 'chars');
+
+          const hasDevanagari = /[\u0900-\u097F]/.test(extractedText);
+          if (hasDevanagari) {
+            hindiLyrics = extractedText;
+          } else {
+            romanizedLyrics = extractedText;
+          }
         }
       }
     }
 
-    // Debug: if still low chars, dump what we found
+    // Method 3: Check if there are multiple tabs (Hindi / English tabs)
+    if (!hindiLyrics || !romanizedLyrics) {
+      const allPanels = $('div[data-target="tabs.panel"]');
+
+      if (allPanels.length > 1) {
+        console.log('[LYRICSMINT] Found multiple tabs:', allPanels.length);
+
+        allPanels.each((i, panel) => {
+          const textContainer = $(panel).find('div.text-base, div[class*="text-base"]').first();
+          if (!textContainer.length) return;
+
+          const paragraphs = textContainer.find('p');
+          const lines = [];
+
+          paragraphs.each((j, p) => {
+            const pHtml = $(p).html() || '';
+            const pText = pHtml
+              .replace(/<br\s*\/?>/gi, '\n')
+              .replace(/<[^>]+>/g, '')
+              .replace(/[""]|&ldquo;|&rdquo;/g, '"')
+              .replace(/['']|&lsquo;|&rsquo;/g, "'")
+              .trim();
+
+            if (pText.length > 0) lines.push(pText);
+          });
+
+          const text = lines.join('\n\n');
+          if (text.length < 50) return;
+
+          const hasDevanagari = /[\u0900-\u097F]/.test(text);
+
+          if (hasDevanagari && !hindiLyrics) {
+            hindiLyrics = text;
+            console.log('[LYRICSMINT] Found Hindi in tab', i, ':', text.length, 'chars');
+          } else if (!hasDevanagari && !romanizedLyrics) {
+            romanizedLyrics = text;
+            console.log('[LYRICSMINT] Found romanized in tab', i, ':', text.length, 'chars');
+          }
+        });
+      }
+    }
+
+    // Clean up the extracted lyrics
+    if (romanizedLyrics) {
+      romanizedLyrics = cleanLyrics(romanizedLyrics);
+    }
+    if (hindiLyrics) {
+      hindiLyrics = cleanLyrics(hindiLyrics);
+    }
+
+    console.log('[LYRICSMINT] Final romanized:', romanizedLyrics ? romanizedLyrics.length + ' chars' : 'none');
+    console.log('[LYRICSMINT] Final Hindi:', hindiLyrics ? hindiLyrics.length + ' chars' : 'none');
+
+    // Debug if extraction is still low
     if ((!romanizedLyrics || romanizedLyrics.length < 200) && (!hindiLyrics || hindiLyrics.length < 200)) {
-      console.log('[LYRICSMINT] WARNING: Low lyrics extracted');
-      console.log('[LYRICSMINT] DEBUG: Entry content classes:', $('.entry-content').attr('class'));
-      console.log('[LYRICSMINT] DEBUG: First 500 chars of entry-content:');
-      console.log($('.entry-content').text().substring(0, 500));
+      console.log('[LYRICSMINT] WARNING: Low lyrics count. Debug info:');
+      console.log('[LYRICSMINT] tabs.panel count:', $('div[data-target="tabs.panel"]').length);
+      console.log('[LYRICSMINT] text-base divs:', $('div.text-base').length);
+      console.log('[LYRICSMINT] p tags in entry-content:', $('.entry-content p').length);
     }
 
     if (!romanizedLyrics && !hindiLyrics) {
       console.log('[LYRICSMINT] Could not extract lyrics');
       return null;
     }
-
-    // Clean up the extracted lyrics
-    romanizedLyrics = romanizedLyrics ? cleanLyrics(romanizedLyrics) : null;
-    hindiLyrics = hindiLyrics ? cleanLyrics(hindiLyrics) : null;
-
-    console.log('[LYRICSMINT] Final romanized:', romanizedLyrics ? romanizedLyrics.length + ' chars' : 'none');
-    console.log('[LYRICSMINT] Final Hindi:', hindiLyrics ? hindiLyrics.length + ' chars' : 'none');
 
     return {
       romanizedLyrics,
@@ -421,7 +422,28 @@ async function scrapeLyricsPage(pageUrl) {
 }
 
 /**
- * Clean lyrics HTML to text
+ * Clean lyrics text
+ */
+function cleanLyrics(text) {
+  if (!text) return '';
+
+  return text
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => {
+      if (line.length < 2) return false;
+      // Remove metadata lines
+      if (/^(singer|music|lyrics|composer|movie|album|label|starring|director)[:\s]/i.test(line)) return false;
+      if (/^(copyright|all rights|share this|click here)/i.test(line)) return false;
+      return true;
+    })
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')  // Max 2 newlines
+    .trim();
+}
+
+/**
+ * Clean lyrics HTML to text (legacy helper)
  */
 function cleanLyricsHtml(html) {
   return html
@@ -433,38 +455,6 @@ function cleanLyricsHtml(html) {
     .replace(/&amp;/g, '&')
     .replace(/&#?[a-z0-9]+;/gi, '')
     .trim();
-}
-
-/**
- * Clean lyrics text
- */
-function cleanLyrics(text) {
-  const lines = text
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => {
-      if (line.length < 2) return false;
-      // Remove metadata lines
-      if (/^(singer|music|lyrics|composer|movie|album|label|starring|director)[:\s]/i.test(line)) return false;
-      if (/^(copyright|all rights|share this)/i.test(line)) return false;
-      return true;
-    });
-
-  return lines.join('\n').trim();
-}
-
-/**
- * Check if text looks like song lyrics
- */
-function isLikelyLyrics(text) {
-  const lines = text.split('\n').filter(l => l.trim());
-  if (lines.length < 4) return false;
-
-  // Lyrics typically have short-medium length lines
-  const avgLength = lines.reduce((sum, l) => sum + l.length, 0) / lines.length;
-  if (avgLength > 100) return false; // Too long, probably prose
-
-  return true;
 }
 
 /**

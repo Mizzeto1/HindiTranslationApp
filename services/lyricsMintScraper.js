@@ -1,17 +1,19 @@
 /**
  * LyricsMint Scraper
- * Searches and scrapes lyrics from lyricsmint.com
- * Uses Google/DuckDuckGo search since LyricsMint's own search is broken
- * Extracts romanized Hindi lyrics (Hindi written in English letters)
+ * Uses LLM to identify artist, then constructs URL directly
+ * Google/DuckDuckGo scraping doesn't work (they require JavaScript)
  */
 
 const cheerio = require('cheerio');
+const Groq = require('groq-sdk');
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // Rate limiting
 let lastRequestTime = 0;
-const MIN_INTERVAL = 1200; // 1.2 seconds between requests
+const MIN_INTERVAL = 1000;
 
-async function rateLimitedFetch(url, customHeaders = {}) {
+async function rateLimitedFetch(url, options = {}) {
   const now = Date.now();
   const wait = MIN_INTERVAL - (now - lastRequestTime);
   if (wait > 0) {
@@ -19,273 +21,122 @@ async function rateLimitedFetch(url, customHeaders = {}) {
   }
   lastRequestTime = Date.now();
 
-  console.log(`[LYRICSMINT] Fetching: ${url}`);
-
-  const response = await fetch(url, {
+  return fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
-      ...customHeaders
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+      ...options.headers
     },
-    timeout: 15000
+    ...options
   });
-
-  return response;
 }
 
 /**
- * Check if URL is a valid lyrics page
+ * Use LLM to identify the actual artist of a Bollywood song
  */
-function isValidLyricsUrl(href) {
-  if (!href) return false;
-  if (!href.includes('lyricsmint.com')) return false;
+async function identifyArtist(songTitle) {
+  try {
+    console.log('[LYRICSMINT] Asking LLM to identify artist for:', songTitle);
 
-  // Reject homepage
-  if (href.match(/^https?:\/\/(www\.)?lyricsmint\.com\/?$/)) {
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a Bollywood music expert. Given a song title, identify the main singer/artist.
+
+Rules:
+- Return ONLY the artist name, nothing else
+- If multiple singers, return the most famous one
+- Use the romanized name (English letters)
+- If you don't know, return "unknown"
+- Don't include "feat." or featured artists
+- For movie songs, identify the actual singer, not actors
+
+Examples:
+- "Tum Hi Ho" → Arijit Singh
+- "Kal Ho Naa Ho" → Sonu Nigam
+- "Chaiyya Chaiyya" → Sukhwinder Singh
+- "Teri Ni Kararan" → Diljit Dosanjh
+- "Kesariya" → Arijit Singh
+- "Naatu Naatu" → Rahul Sipligunj`
+        },
+        {
+          role: 'user',
+          content: `Song: "${songTitle}"\n\nWho is the singer?`
+        }
+      ],
+      temperature: 0,
+      max_tokens: 50
+    });
+
+    const artist = response.choices[0].message.content.trim();
+    console.log('[LYRICSMINT] LLM identified artist:', artist);
+
+    // Clean up the response
+    const cleanArtist = artist
+      .replace(/^(the\s+)?singer\s+(is\s+)?/i, '')
+      .replace(/['"]/g, '')
+      .trim();
+
+    if (cleanArtist.toLowerCase() === 'unknown' || cleanArtist.length < 2) {
+      return null;
+    }
+
+    return cleanArtist;
+
+  } catch (error) {
+    console.error('[LYRICSMINT] LLM artist identification failed:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Convert text to URL slug
+ */
+function toSlug(text) {
+  return text
+    .toLowerCase()
+    .replace(/[''`]/g, '')           // Remove apostrophes
+    .replace(/[^a-z0-9\s-]/g, '')    // Remove special chars
+    .replace(/\s+/g, '-')            // Spaces to dashes
+    .replace(/-+/g, '-')             // Multiple dashes to single
+    .replace(/^-|-$/g, '')           // Trim dashes
+    .substring(0, 50);               // Limit length
+}
+
+/**
+ * Clean song title for searching
+ */
+function cleanSongTitle(title) {
+  return title
+    .replace(/["'"]/g, '')
+    .replace(/\s*\(From\s+["']?[^)]+["']?\)\s*/gi, '')
+    .replace(/\s*\(.*?\)\s*/g, '')
+    .replace(/\s*\|.*$/g, '')
+    .replace(/\s*-\s*(Official|Full|Audio|Video|Lyric|HD|4K).*$/gi, '')
+    .replace(/\s*\[.*?\]\s*/g, '')
+    .trim();
+}
+
+/**
+ * Check if a LyricsMint URL exists
+ */
+async function checkUrlExists(url) {
+  try {
+    console.log('[LYRICSMINT] Checking URL:', url);
+    const response = await rateLimitedFetch(url, { method: 'HEAD' });
+    console.log('[LYRICSMINT] URL status:', response.status);
+    return response.ok;
+  } catch (error) {
+    console.log('[LYRICSMINT] URL check failed:', error.message);
     return false;
   }
-
-  // Must have artist/song pattern
-  const pattern = /lyricsmint\.com\/[a-z0-9_-]+\/[a-z0-9_-]+/i;
-  if (!pattern.test(href)) return false;
-
-  // Reject utility pages
-  const rejectPatterns = [
-    '/category/', '/tag/', '/author/', '/page/',
-    '/wp-content/', '/wp-admin/', '/feed/',
-    '/contact', '/about', '/privacy', '/terms',
-    '/search', '/?s='
-  ];
-
-  for (const reject of rejectPatterns) {
-    if (href.includes(reject)) return false;
-  }
-
-  return true;
 }
 
 /**
- * Try to construct LyricsMint URL directly
- * URL pattern: lyricsmint.com/artist-name/song-name
- */
-async function tryDirectUrl(songTitle, artistName) {
-  if (!artistName) {
-    console.log('[LYRICSMINT] No artist name for direct URL');
-    return null;
-  }
-
-  const artistSlug = artistName
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')
-    .replace(/\s+/g, '-')
-    .substring(0, 50);
-
-  const songSlug = songTitle
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')
-    .replace(/\s+/g, '-')
-    .substring(0, 50);
-
-  const directUrl = `https://www.lyricsmint.com/${artistSlug}/${songSlug}`;
-  console.log('[LYRICSMINT] Trying direct URL:', directUrl);
-
-  try {
-    const response = await fetch(directUrl, {
-      method: 'HEAD',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    if (response.ok) {
-      console.log('[LYRICSMINT] Direct URL exists!');
-      return directUrl;
-    } else {
-      console.log('[LYRICSMINT] Direct URL returned:', response.status);
-    }
-  } catch (e) {
-    console.log('[LYRICSMINT] Direct URL check failed:', e.message);
-  }
-
-  return null;
-}
-
-/**
- * Search using Google
- */
-async function searchWithGoogle(songTitle, artistName) {
-  try {
-    const cleanTitle = songTitle
-      .replace(/["'"]/g, '')
-      .replace(/\s*\(.*?\)\s*/g, '')
-      .replace(/\s*\|.*$/g, '')
-      .trim();
-
-    const query = `${cleanTitle} ${artistName || ''} lyrics site:lyricsmint.com`.trim();
-    const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-
-    console.log('[LYRICSMINT] Google search:', query);
-
-    const response = await fetch(googleUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5'
-      }
-    });
-
-    if (!response.ok) {
-      console.log('[LYRICSMINT] Google search failed:', response.status);
-      return null;
-    }
-
-    const html = await response.text();
-    console.log('[LYRICSMINT] Google response length:', html.length);
-
-    // Check if Google is blocking us
-    if (html.includes('detected unusual traffic') || html.includes('captcha') || html.includes('CAPTCHA')) {
-      console.log('[LYRICSMINT] Google is blocking automated requests');
-      return null;
-    }
-
-    // Extract LyricsMint URLs from Google results
-    const lyricsMintUrls = [];
-
-    // Pattern 1: Direct href links
-    const hrefPattern = /href="(https?:\/\/(www\.)?lyricsmint\.com\/[^"]+)"/gi;
-    let match;
-    while ((match = hrefPattern.exec(html)) !== null) {
-      const url = match[1];
-      if (isValidLyricsUrl(url)) {
-        lyricsMintUrls.push(url);
-      }
-    }
-
-    // Pattern 2: URL in Google's redirect format /url?q=...
-    const redirectPattern = /\/url\?q=(https?:\/\/(www\.)?lyricsmint\.com\/[^&"]+)/gi;
-    while ((match = redirectPattern.exec(html)) !== null) {
-      const url = decodeURIComponent(match[1]);
-      if (isValidLyricsUrl(url)) {
-        lyricsMintUrls.push(url);
-      }
-    }
-
-    // Pattern 3: Plain text URLs in the page
-    const plainPattern = /(https?:\/\/(www\.)?lyricsmint\.com\/[a-z0-9-]+\/[a-z0-9-]+)/gi;
-    while ((match = plainPattern.exec(html)) !== null) {
-      const url = match[1];
-      if (isValidLyricsUrl(url)) {
-        lyricsMintUrls.push(url);
-      }
-    }
-
-    // Remove duplicates
-    const uniqueUrls = [...new Set(lyricsMintUrls)];
-
-    console.log('[LYRICSMINT] Found URLs from Google:', uniqueUrls.length);
-    uniqueUrls.slice(0, 3).forEach((url, i) => {
-      console.log(`[LYRICSMINT]   ${i + 1}. ${url}`);
-    });
-
-    if (uniqueUrls.length > 0) {
-      return uniqueUrls[0];
-    }
-
-    return null;
-
-  } catch (error) {
-    console.error('[LYRICSMINT] Google search error:', error.message);
-    return null;
-  }
-}
-
-/**
- * Search using DuckDuckGo (fallback, less likely to block)
- */
-async function searchWithDuckDuckGo(songTitle, artistName) {
-  try {
-    const cleanTitle = songTitle
-      .replace(/["'"]/g, '')
-      .replace(/\s*\(.*?\)\s*/g, '')
-      .replace(/\s*\|.*$/g, '')
-      .trim();
-
-    const query = `${cleanTitle} ${artistName || ''} lyrics site:lyricsmint.com`.trim();
-    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-
-    console.log('[LYRICSMINT] DuckDuckGo search:', query);
-
-    const response = await fetch(ddgUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    if (!response.ok) {
-      console.log('[LYRICSMINT] DuckDuckGo search failed:', response.status);
-      return null;
-    }
-
-    const html = await response.text();
-    console.log('[LYRICSMINT] DuckDuckGo response length:', html.length);
-
-    const $ = cheerio.load(html);
-    let foundUrl = null;
-
-    // DuckDuckGo HTML results have links in result__url class or result__a
-    $('.result__url, .result__a, .result a').each((i, el) => {
-      const href = $(el).attr('href');
-      const text = $(el).text();
-
-      // Check href first
-      if (href && href.includes('lyricsmint.com') && isValidLyricsUrl(href)) {
-        console.log('[LYRICSMINT] Found in DDG href:', href);
-        foundUrl = href;
-        return false;
-      }
-
-      // Check text content (DDG sometimes shows URL as text)
-      if (text && text.includes('lyricsmint.com')) {
-        const urlMatch = text.match(/(https?:\/\/)?(www\.)?lyricsmint\.com\/[a-z0-9-]+\/[a-z0-9-]+/i);
-        if (urlMatch) {
-          let url = urlMatch[0];
-          if (!url.startsWith('http')) {
-            url = 'https://' + url;
-          }
-          if (isValidLyricsUrl(url)) {
-            console.log('[LYRICSMINT] Found in DDG text:', url);
-            foundUrl = url;
-            return false;
-          }
-        }
-      }
-    });
-
-    // Also search in raw HTML for URLs
-    if (!foundUrl) {
-      const urlPattern = /(https?:\/\/(www\.)?lyricsmint\.com\/[a-z0-9-]+\/[a-z0-9-]+)/gi;
-      let match;
-      while ((match = urlPattern.exec(html)) !== null) {
-        if (isValidLyricsUrl(match[1])) {
-          console.log('[LYRICSMINT] Found in DDG raw HTML:', match[1]);
-          foundUrl = match[1];
-          break;
-        }
-      }
-    }
-
-    return foundUrl;
-
-  } catch (error) {
-    console.error('[LYRICSMINT] DuckDuckGo search error:', error.message);
-    return null;
-  }
-}
-
-/**
- * Main search function - tries multiple methods with verbose logging
- * Uses multiple URL extraction methods to handle Google's encoding
+ * Search for lyrics by trying multiple URL patterns
  */
 async function searchLyricsMint(songTitle, artistName) {
   console.log('[LYRICSMINT] ============ SEARCH START ============');
@@ -293,172 +144,80 @@ async function searchLyricsMint(songTitle, artistName) {
   console.log('[LYRICSMINT] Input artistName:', artistName);
 
   try {
-    // Clean song title
-    const cleanTitle = songTitle
-      .replace(/["'"]/g, '')
-      .replace(/\s*\(From\s+["']?[^)]+["']?\)\s*/gi, '')  // Remove (From "Movie")
-      .replace(/\s*\(.*?\)\s*/g, '')
-      .replace(/\s*\|.*$/g, '')
-      .replace(/\s*-\s*$/, '')
-      .trim();
+    const cleanTitle = cleanSongTitle(songTitle);
+    const songSlug = toSlug(cleanTitle);
 
     console.log('[LYRICSMINT] Cleaned title:', cleanTitle);
+    console.log('[LYRICSMINT] Song slug:', songSlug);
 
-    // Build Google search query
-    const query = `${cleanTitle} lyrics site:lyricsmint.com`;
-    const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
-
-    console.log('[LYRICSMINT] Google URL:', googleUrl);
-
-    const response = await fetch(googleUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9'
-      }
-    });
-
-    console.log('[LYRICSMINT] Google response status:', response.status);
-
-    if (!response.ok) {
-      console.log('[LYRICSMINT] Google request failed');
-      return await tryDuckDuckGoSearch(cleanTitle);
-    }
-
-    const html = await response.text();
-    console.log('[LYRICSMINT] Google HTML length:', html.length);
-
-    // Check for blocking
-    if (html.includes('unusual traffic') || html.includes('captcha') || html.includes('CAPTCHA')) {
-      console.log('[LYRICSMINT] Google is blocking (captcha)');
-      return await tryDuckDuckGoSearch(cleanTitle);
-    }
-
-    // Extract URLs using multiple methods
-    const foundUrls = new Set();
-
-    // Method 1: Look for /url?q= redirects (URL encoded)
-    const redirectPattern = /\/url\?q=(https?[^&"]+lyricsmint\.com[^&"]*)/gi;
-    let match;
-    while ((match = redirectPattern.exec(html)) !== null) {
-      try {
-        const decoded = decodeURIComponent(match[1]);
-        if (isValidLyricsUrl(decoded)) {
-          console.log('[LYRICSMINT] Found via /url?q=:', decoded);
-          foundUrls.add(decoded);
-        }
-      } catch (e) {}
-    }
-
-    // Method 2: Look for URL-encoded lyricsmint URLs
-    const encodedPattern = /https?%3A%2F%2F(?:www\.)?lyricsmint\.com%2F[a-zA-Z0-9%_-]+%2F[a-zA-Z0-9%_-]+/gi;
-    while ((match = encodedPattern.exec(html)) !== null) {
-      try {
-        const decoded = decodeURIComponent(match[0]);
-        if (isValidLyricsUrl(decoded)) {
-          console.log('[LYRICSMINT] Found URL-encoded:', decoded);
-          foundUrls.add(decoded);
-        }
-      } catch (e) {}
-    }
-
-    // Method 3: Look for plain URLs (less likely but try anyway)
-    const plainPattern = /https?:\/\/(?:www\.)?lyricsmint\.com\/[a-z0-9_-]+\/[a-z0-9_-]+/gi;
-    while ((match = plainPattern.exec(html)) !== null) {
-      if (isValidLyricsUrl(match[0])) {
-        console.log('[LYRICSMINT] Found plain URL:', match[0]);
-        foundUrls.add(match[0]);
-      }
-    }
-
-    // Method 4: Look for lyricsmint.com anywhere and extract path
-    const domainPattern = /lyricsmint\.com\/([a-zA-Z0-9%_-]+)\/([a-zA-Z0-9%_-]+)/gi;
-    while ((match = domainPattern.exec(html)) !== null) {
-      try {
-        const artist = decodeURIComponent(match[1]);
-        const song = decodeURIComponent(match[2]);
-        const url = `https://www.lyricsmint.com/${artist}/${song}`;
-        if (isValidLyricsUrl(url)) {
-          console.log('[LYRICSMINT] Found via domain pattern:', url);
-          foundUrls.add(url);
-        }
-      } catch (e) {}
-    }
-
-    // Method 5: Parse with Cheerio and look for href attributes
-    const $ = cheerio.load(html);
-
-    $('a[href*="lyricsmint"]').each((i, el) => {
-      let href = $(el).attr('href');
-      if (href) {
-        // Handle Google redirect URLs
-        if (href.startsWith('/url?')) {
-          const urlParams = new URLSearchParams(href.substring(5));
-          href = urlParams.get('q') || href;
-        }
-        try {
-          href = decodeURIComponent(href);
-        } catch (e) {}
-
-        if (isValidLyricsUrl(href)) {
-          console.log('[LYRICSMINT] Found via Cheerio href:', href);
-          foundUrls.add(href);
-        }
-      }
-    });
-
-    // Also check cite/span elements (Google shows URLs in these)
-    $('cite, span').each((i, el) => {
-      const text = $(el).text();
-      if (text.includes('lyricsmint.com/')) {
-        const urlMatch = text.match(/lyricsmint\.com\/([a-z0-9-]+)\/([a-z0-9-]+)/i);
-        if (urlMatch) {
-          const url = `https://www.lyricsmint.com/${urlMatch[1]}/${urlMatch[2]}`;
-          console.log('[LYRICSMINT] Found in cite/span text:', url);
-          foundUrls.add(url);
-        }
-      }
-    });
-
-    console.log('[LYRICSMINT] Total unique URLs found:', foundUrls.size);
-
-    if (foundUrls.size > 0) {
-      const urlArray = Array.from(foundUrls);
-      urlArray.forEach((url, i) => console.log(`[LYRICSMINT]   ${i + 1}. ${url}`));
-
-      // Return the first valid URL
-      for (const url of urlArray) {
-        // Verify URL actually exists with HEAD request
-        try {
-          const checkResponse = await fetch(url, {
-            method: 'HEAD',
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-          });
-          if (checkResponse.ok) {
-            console.log('[LYRICSMINT] Verified URL exists:', url);
-            console.log('[LYRICSMINT] ============ SEARCH END ============');
-            return url;
-          } else {
-            console.log('[LYRICSMINT] URL returned', checkResponse.status, ':', url);
-          }
-        } catch (e) {
-          console.log('[LYRICSMINT] Could not verify URL:', url);
-        }
-      }
-
-      // If verification failed, return first URL anyway
-      console.log('[LYRICSMINT] Returning first URL without verification:', urlArray[0]);
+    if (!songSlug || songSlug.length < 2) {
+      console.log('[LYRICSMINT] Song slug too short');
       console.log('[LYRICSMINT] ============ SEARCH END ============');
-      return urlArray[0];
+      return null;
     }
 
-    // Debug: dump a sample of the HTML to see what we're getting
-    console.log('[LYRICSMINT] DEBUG - Sample of Google HTML (first 2000 chars):');
-    console.log(html.substring(0, 2000));
+    // Collect potential artists to try
+    const artistsToTry = [];
 
-    // Fallback to DuckDuckGo
-    console.log('[LYRICSMINT] No URLs found in Google, trying DuckDuckGo...');
-    return await tryDuckDuckGoSearch(cleanTitle);
+    // 1. Use LLM to identify the actual artist
+    const llmArtist = await identifyArtist(cleanTitle);
+    if (llmArtist) {
+      artistsToTry.push(llmArtist);
+    }
+
+    // 2. Use provided artist name if different
+    if (artistName && artistName.length > 2) {
+      const cleanArtist = artistName.split(',')[0].trim(); // Take first if multiple
+      if (!artistsToTry.includes(cleanArtist)) {
+        artistsToTry.push(cleanArtist);
+      }
+    }
+
+    // 3. Try some common variations
+    artistsToTry.push('arijit-singh');  // Most popular Hindi singer
+
+    console.log('[LYRICSMINT] Artists to try:', artistsToTry);
+
+    // Try each artist
+    for (const artist of artistsToTry) {
+      const artistSlug = toSlug(artist);
+      if (!artistSlug || artistSlug.length < 2) continue;
+
+      // Try standard URL pattern: /artist/song
+      const url1 = `https://www.lyricsmint.com/${artistSlug}/${songSlug}`;
+      if (await checkUrlExists(url1)) {
+        console.log('[LYRICSMINT] Found URL:', url1);
+        console.log('[LYRICSMINT] ============ SEARCH END ============');
+        return url1;
+      }
+
+      // Try without www
+      const url2 = `https://lyricsmint.com/${artistSlug}/${songSlug}`;
+      if (await checkUrlExists(url2)) {
+        console.log('[LYRICSMINT] Found URL:', url2);
+        console.log('[LYRICSMINT] ============ SEARCH END ============');
+        return url2;
+      }
+    }
+
+    // Try song-only patterns (some pages might use this)
+    const songOnlyUrls = [
+      `https://www.lyricsmint.com/${songSlug}-lyrics`,
+      `https://www.lyricsmint.com/lyrics/${songSlug}`,
+      `https://lyricsmint.com/${songSlug}-lyrics`
+    ];
+
+    for (const url of songOnlyUrls) {
+      if (await checkUrlExists(url)) {
+        console.log('[LYRICSMINT] Found URL (song-only pattern):', url);
+        console.log('[LYRICSMINT] ============ SEARCH END ============');
+        return url;
+      }
+    }
+
+    console.log('[LYRICSMINT] No valid URL found');
+    console.log('[LYRICSMINT] ============ SEARCH END ============');
+    return null;
 
   } catch (error) {
     console.error('[LYRICSMINT] Search error:', error.message);
@@ -468,264 +227,113 @@ async function searchLyricsMint(songTitle, artistName) {
 }
 
 /**
- * DuckDuckGo search fallback
- */
-async function tryDuckDuckGoSearch(searchTerm) {
-  try {
-    const query = `${searchTerm} lyrics site:lyricsmint.com`;
-    const ddgUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-
-    console.log('[LYRICSMINT] DuckDuckGo URL:', ddgUrl);
-
-    const response = await fetch(ddgUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-
-    console.log('[LYRICSMINT] DuckDuckGo status:', response.status);
-
-    if (!response.ok) {
-      console.log('[LYRICSMINT] ============ SEARCH END ============');
-      return null;
-    }
-
-    const html = await response.text();
-    console.log('[LYRICSMINT] DuckDuckGo HTML length:', html.length);
-
-    const $ = cheerio.load(html);
-
-    // DuckDuckGo shows URLs in result__url class or result links
-    let foundUrl = null;
-
-    // Check result links
-    $('.result__a, .result__url, a[href*="lyricsmint"]').each((i, el) => {
-      let href = $(el).attr('href');
-      const text = $(el).text();
-
-      // DuckDuckGo sometimes has the URL in text
-      if (text.includes('lyricsmint.com/')) {
-        const match = text.match(/lyricsmint\.com\/([a-z0-9-]+)\/([a-z0-9-]+)/i);
-        if (match) {
-          foundUrl = `https://www.lyricsmint.com/${match[1]}/${match[2]}`;
-          console.log('[LYRICSMINT] DuckDuckGo found in text:', foundUrl);
-          return false;
-        }
-      }
-
-      // Check href
-      if (href && href.includes('lyricsmint.com')) {
-        // DuckDuckGo uses redirect URLs
-        if (href.includes('uddg=')) {
-          const uddgMatch = href.match(/uddg=([^&]+)/);
-          if (uddgMatch) {
-            href = decodeURIComponent(uddgMatch[1]);
-          }
-        }
-
-        if (isValidLyricsUrl(href)) {
-          foundUrl = href;
-          console.log('[LYRICSMINT] DuckDuckGo found URL:', foundUrl);
-          return false;
-        }
-      }
-    });
-
-    console.log('[LYRICSMINT] ============ SEARCH END ============');
-    return foundUrl;
-
-  } catch (error) {
-    console.error('[LYRICSMINT] DuckDuckGo error:', error.message);
-    console.log('[LYRICSMINT] ============ SEARCH END ============');
-    return null;
-  }
-}
-
-/**
- * Clean HTML to plain text lyrics
- */
-function cleanLyricsHtml(html) {
-  let text = html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&#?[a-z0-9]+;/gi, '')
-    .trim();
-
-  // Clean up whitespace
-  text = text
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 0)
-    .join('\n');
-
-  // Remove metadata lines
-  const removePatterns = [
-    /^lyrics\s*$/im,
-    /^song\s*:?\s*$/im,
-    /^singer\s*:/im,
-    /^music\s*:/im,
-    /^composer\s*:/im,
-    /^lyricist\s*:/im,
-    /^movie\s*:/im,
-    /^album\s*:/im,
-    /^label\s*:/im,
-    /^starring\s*:/im,
-    /^director\s*:/im,
-    /^share this/im,
-    /^copyright/im,
-    /^all rights reserved/im,
-    /^\[.*\]$/m
-  ];
-
-  let lines = text.split('\n');
-  lines = lines.filter(line => {
-    const trimmed = line.trim();
-    return !removePatterns.some(pattern => pattern.test(trimmed));
-  });
-
-  return lines.join('\n').trim();
-}
-
-/**
- * Scrape lyrics from a LyricsMint lyrics page
- * Returns romanized Hindi (Hindi written in English letters)
+ * Scrape lyrics from a LyricsMint page
  */
 async function scrapeLyricsPage(pageUrl) {
   try {
+    console.log('[LYRICSMINT] Scraping page:', pageUrl);
+
     const response = await rateLimitedFetch(pageUrl);
 
     if (!response.ok) {
-      console.log(`[LYRICSMINT] Page returned ${response.status}`);
+      console.log('[LYRICSMINT] Page returned:', response.status);
       return null;
     }
 
     const html = await response.text();
     const $ = cheerio.load(html);
 
-    // Remove script and style tags
-    $('script, style, noscript').remove();
+    console.log('[LYRICSMINT] Page HTML length:', html.length);
 
-    let hindiLyrics = '';      // Devanagari: तुम ही हो
-    let romanizedLyrics = '';  // Romanized: Tum hi ho
+    // Remove unwanted elements
+    $('script, style, noscript, nav, header, footer, .sidebar, .comments, .related-posts, .share-buttons, .ad, .advertisement').remove();
 
-    // Method 1: Look for explicit Hindi/English sections by headers
-    const content = $('.entry-content').html() || '';
+    // Try to find lyrics content
+    let romanizedLyrics = '';
+    let hindiLyrics = '';
 
-    // Try to find labeled sections
-    const englishMatch = content.match(/english\s*lyrics[:\s]*([\s\S]*?)(?=hindi\s*lyrics|$)/i);
-    const hindiMatch = content.match(/hindi\s*lyrics[:\s]*([\s\S]*?)(?=english\s*lyrics|$)/i);
+    // LyricsMint often has sections for Hindi and English/Romanized
+    // Look for headers that indicate sections
+    const content = $('.entry-content, .post-content, article').first();
+
+    if (content.length === 0) {
+      console.log('[LYRICSMINT] No content container found');
+      return null;
+    }
+
+    // Get all text content
+    const fullText = content.text();
+
+    // Split by common section headers
+    const hindiMatch = fullText.match(/hindi\s*lyrics[:\s]*([\s\S]*?)(?=english|romanized|translation|$)/i);
+    const englishMatch = fullText.match(/(?:english|romanized)\s*lyrics[:\s]*([\s\S]*?)(?=hindi|translation|meaning|$)/i);
 
     if (englishMatch) {
-      romanizedLyrics = cleanLyricsHtml(englishMatch[1]);
+      romanizedLyrics = cleanLyrics(englishMatch[1]);
+      console.log('[LYRICSMINT] Found romanized section:', romanizedLyrics.substring(0, 100) + '...');
     }
+
     if (hindiMatch) {
-      hindiLyrics = cleanLyricsHtml(hindiMatch[1]);
+      hindiLyrics = cleanLyrics(hindiMatch[1]);
+      console.log('[LYRICSMINT] Found Hindi section:', hindiLyrics.substring(0, 100) + '...');
     }
 
-    // Method 2: If no labeled sections, analyze the content
+    // If no clear sections, look for content patterns
+    if (!romanizedLyrics) {
+      // Find paragraphs that look like lyrics (multiple short lines)
+      const paragraphs = content.find('p');
+      const lyricsBlocks = [];
+
+      paragraphs.each((i, p) => {
+        const text = $(p).html() || '';
+        // Lyrics often have <br> tags or are short lines
+        if (text.includes('<br') || $(p).text().split('\n').length > 2) {
+          const cleaned = cleanLyricsHtml(text);
+          if (cleaned.length > 50 && isLikelyLyrics(cleaned)) {
+            lyricsBlocks.push(cleaned);
+          }
+        }
+      });
+
+      if (lyricsBlocks.length > 0) {
+        // Separate Devanagari and Romanized
+        for (const block of lyricsBlocks) {
+          const hasDevanagari = /[\u0900-\u097F]/.test(block);
+          if (hasDevanagari && !hindiLyrics) {
+            hindiLyrics = block;
+          } else if (!hasDevanagari && !romanizedLyrics) {
+            romanizedLyrics = block;
+          }
+        }
+      }
+    }
+
+    // If we still don't have romanized, try to get any text that looks like lyrics
     if (!romanizedLyrics && !hindiLyrics) {
-      const lyricsSelectors = [
-        '.entry-content',
-        '.lyrics-content',
-        '.song-lyrics',
-        '.lyrics',
-        'article .content',
-        '.post-content'
-      ];
+      const mainText = content.find('p, div').map((i, el) => $(el).text()).get().join('\n');
+      const cleaned = cleanLyrics(mainText);
 
-      let lyricsHtml = '';
-      for (const selector of lyricsSelectors) {
-        const container = $(selector).first();
-        if (container.length > 0) {
-          lyricsHtml = container.html();
-          if (lyricsHtml && lyricsHtml.length > 200) {
-            break;
-          }
-        }
-      }
-
-      if (lyricsHtml) {
-        const cleanedText = cleanLyricsHtml(lyricsHtml);
-
-        // Separate Devanagari and romanized lines
-        const lines = cleanedText.split('\n');
-        const devanagariLines = [];
-        const romanLines = [];
-
-        lines.forEach(line => {
-          const trimmed = line.trim();
-          if (!trimmed) return;
-
-          // Check if line contains Devanagari characters
-          const hasDevanagari = /[\u0900-\u097F]/.test(trimmed);
-
-          if (hasDevanagari) {
-            devanagariLines.push(trimmed);
-          } else if (/[a-zA-Z]/.test(trimmed)) {
-            // Line has Latin characters - likely romanized Hindi
-            romanLines.push(trimmed);
-          }
-        });
-
-        // If we found both types, use them
-        if (devanagariLines.length > 0 && romanLines.length > 0) {
-          hindiLyrics = devanagariLines.join('\n');
-          romanizedLyrics = romanLines.join('\n');
-        } else if (romanLines.length > 0) {
-          // Only romanized found
-          romanizedLyrics = romanLines.join('\n');
-        } else if (devanagariLines.length > 0) {
-          // Only Devanagari found
-          hindiLyrics = devanagariLines.join('\n');
+      if (cleaned.length > 100) {
+        const hasDevanagari = /[\u0900-\u097F]/.test(cleaned);
+        if (hasDevanagari) {
+          hindiLyrics = cleaned;
         } else {
-          // Mixed or unclear - assume it's romanized if mostly Latin
-          const hasLatin = /[a-zA-Z]/.test(cleanedText);
-          if (hasLatin) {
-            romanizedLyrics = cleanedText;
-          } else {
-            hindiLyrics = cleanedText;
-          }
+          romanizedLyrics = cleaned;
         }
       }
     }
 
-    // We prefer romanized lyrics for display
     if (!romanizedLyrics && !hindiLyrics) {
       console.log('[LYRICSMINT] Could not extract lyrics');
       return null;
     }
 
-    // If we only have Devanagari, we can't display romanized
-    if (!romanizedLyrics && hindiLyrics) {
-      console.log('[LYRICSMINT] Only found Devanagari, no romanized version');
-      return {
-        hindiLyrics: hindiLyrics,
-        romanizedLyrics: null,
-        needsTransliteration: true
-      };
-    }
-
-    // Validate we have enough content
-    if (romanizedLyrics && romanizedLyrics.length < 50) {
-      console.log('[LYRICSMINT] Romanized lyrics too short');
-      return null;
-    }
-
-    console.log(`[LYRICSMINT] Found romanized: ${romanizedLyrics?.length || 0} chars`);
-    if (hindiLyrics) {
-      console.log(`[LYRICSMINT] Found Devanagari: ${hindiLyrics.length} chars`);
-    }
+    console.log('[LYRICSMINT] Extracted romanized:', romanizedLyrics ? romanizedLyrics.length + ' chars' : 'none');
+    console.log('[LYRICSMINT] Extracted Hindi:', hindiLyrics ? hindiLyrics.length + ' chars' : 'none');
 
     return {
-      hindiLyrics: hindiLyrics || null,
-      romanizedLyrics: romanizedLyrics,
-      needsTransliteration: false
+      romanizedLyrics: romanizedLyrics || null,
+      hindiLyrics: hindiLyrics || null
     };
 
   } catch (error) {
@@ -735,17 +343,58 @@ async function scrapeLyricsPage(pageUrl) {
 }
 
 /**
- * Main function: search for and fetch lyrics
+ * Clean lyrics HTML to text
+ */
+function cleanLyricsHtml(html) {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&#?[a-z0-9]+;/gi, '')
+    .trim();
+}
+
+/**
+ * Clean lyrics text
+ */
+function cleanLyrics(text) {
+  const lines = text
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => {
+      if (line.length < 2) return false;
+      // Remove metadata lines
+      if (/^(singer|music|lyrics|composer|movie|album|label|starring|director)[:\s]/i.test(line)) return false;
+      if (/^(copyright|all rights|share this)/i.test(line)) return false;
+      return true;
+    });
+
+  return lines.join('\n').trim();
+}
+
+/**
+ * Check if text looks like song lyrics
+ */
+function isLikelyLyrics(text) {
+  const lines = text.split('\n').filter(l => l.trim());
+  if (lines.length < 4) return false;
+
+  // Lyrics typically have short-medium length lines
+  const avgLength = lines.reduce((sum, l) => sum + l.length, 0) / lines.length;
+  if (avgLength > 100) return false; // Too long, probably prose
+
+  return true;
+}
+
+/**
+ * Main function: find and fetch lyrics
  */
 async function fetchLyrics(songTitle, artistName) {
-  console.log(`[LYRICSMINT] Fetching lyrics for: "${songTitle}" by "${artistName}"`);
+  console.log('[LYRICSMINT] Fetching lyrics for:', songTitle, 'by', artistName);
 
-  if (!songTitle || songTitle.length < 2) {
-    console.log('[LYRICSMINT] Song title too short');
-    return null;
-  }
-
-  // Search for the song
   const pageUrl = await searchLyricsMint(songTitle, artistName);
 
   if (!pageUrl) {
@@ -753,25 +402,14 @@ async function fetchLyrics(songTitle, artistName) {
     return null;
   }
 
-  // Scrape the lyrics page
-  const result = await scrapeLyricsPage(pageUrl);
-
-  if (!result) {
-    return null;
-  }
-
-  return {
-    romanizedLyrics: result.romanizedLyrics,
-    hindiLyrics: result.hindiLyrics,
-    needsTransliteration: result.needsTransliteration || false
-  };
+  const lyrics = await scrapeLyricsPage(pageUrl);
+  return lyrics;
 }
 
 module.exports = {
   fetchLyrics,
   searchLyricsMint,
   scrapeLyricsPage,
-  tryDirectUrl,
-  isValidLyricsUrl,
-  tryDuckDuckGoSearch
+  identifyArtist,
+  toSlug
 };

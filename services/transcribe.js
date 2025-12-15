@@ -113,34 +113,44 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
     throw new Error('Audio file too large (max 25MB)');
   }
 
-  // Step 1: Transcribe with Whisper
+  // Step 1: Transcribe with Whisper - USE .segments for real timestamps!
   console.log('[TRANSCRIBE] Step 1: Calling Whisper...');
 
   const whisperResponse = await groq.audio.transcriptions.create({
     file: fs.createReadStream(audioFilePath),
     model: 'whisper-large-v3',
     language: 'hi',
-    prompt: `Hindi Bollywood song. Transcribe the sung lyrics.`,
+    prompt: 'Hindi Bollywood song lyrics',
     response_format: 'verbose_json',
     temperature: 0.0
   });
 
-  let rawText = whisperResponse.text || '';
-  const duration = whisperResponse.duration || 180;
+  // USE .segments - has real timestamps!
+  const whisperSegments = whisperResponse.segments || [];
+  console.log(`[TRANSCRIBE] Whisper returned ${whisperSegments.length} segments`);
 
-  console.log('[TRANSCRIBE] Whisper returned:', rawText.length, 'chars');
-  console.log('[TRANSCRIBE] Duration:', duration, 'seconds');
-
-  if (rawText.length < 20) {
-    throw new Error('Could not transcribe audio - too short or no vocals detected');
+  if (whisperSegments.length < 3) {
+    throw new Error('Could not transcribe audio - no clear vocals detected');
   }
 
-  // Step 2: Transliterate if Devanagari
-  let romanized = rawText;
+  // Build result with real timestamps from Whisper
+  let segments = whisperSegments.map((seg, i) => ({
+    id: i,
+    start: seg.start,
+    end: seg.end,
+    text: seg.text.trim()
+  }));
 
-  if (isDevanagari(rawText)) {
+  // Combine all text for batch processing
+  const allText = segments.map(s => s.text).join('\n');
+  console.log('[TRANSCRIBE] Total text:', allText.length, 'chars');
+
+  // Step 2: Transliterate if Devanagari
+  let romanized = allText;
+
+  if (isDevanagari(allText)) {
     console.log('[TRANSCRIBE] Step 2: Text is Devanagari, transliterating...');
-    romanized = await transliterate(rawText, videoTitle);
+    romanized = await transliterate(allText, videoTitle);
 
     if (!romanized || romanized.length < 20) {
       throw new Error('Transliteration failed');
@@ -157,21 +167,17 @@ async function transcribeAndTranslate(audioFilePath, options = {}) {
     throw new Error('Translation failed');
   }
 
-  // Step 4: Build segments
-  const romanizedLines = romanized.split('\n').filter(l => l.trim());
-  const englishLines = english.split('\n').filter(l => l.trim());
-  const timePerLine = duration / Math.max(romanizedLines.length, 1);
+  // Step 4: Map translations back to segments with real timestamps
+  const romanizedLines = romanized.split('\n');
+  const englishLines = english.split('\n');
 
-  const segments = romanizedLines.map((line, i) => ({
-    id: i,
-    start: i * timePerLine,
-    end: (i + 1) * timePerLine,
-    romanized: line.trim(),
-    english: englishLines[i]?.trim() || '',
-    text: englishLines[i]?.trim() || line.trim()  // Backwards compatibility
-  }));
+  segments.forEach((seg, i) => {
+    seg.romanized = romanizedLines[i]?.trim() || seg.text;
+    seg.english = englishLines[i]?.trim() || '';
+    seg.text = seg.english || seg.romanized;  // Backwards compatibility
+  });
 
-  console.log('[TRANSCRIBE] Success! Created', segments.length, 'segments');
+  console.log('[TRANSCRIBE] Success! Created', segments.length, 'segments with real timestamps');
   return segments;
 }
 

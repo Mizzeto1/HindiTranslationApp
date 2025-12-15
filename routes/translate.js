@@ -1,21 +1,28 @@
 /**
- * Translation Routes - SIMPLIFIED
+ * Translation Routes
  *
  * Handles the translation API endpoints:
  * - POST /api/search-songs - Search YouTube (unchanged, works great)
  * - POST /api/translate - Translate a YouTube video
  * - GET /api/status/:jobId - Check job status
+ *
+ * Uses LRCLIB as primary lyrics source, Whisper as fallback.
  */
 
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
+const Groq = require('groq-sdk');
 const jobManager = require('../services/jobManager');
 const youtubeService = require('../services/youtube');
 const transcribeService = require('../services/transcribe');
+const lrclib = require('../services/lrclib');
 const userStorage = require('../services/userStorage');
 const { requireAuth, getUserEmail } = require('../middleware/auth');
 const fs = require('fs').promises;
+
+// Initialize Groq for translation
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 /**
  * Extract and clean YouTube URL to get just the video
@@ -231,7 +238,7 @@ router.post('/translate', requireAuth, async (req, res) => {
     const { remaining, used, limit } = await userStorage.getRemainingMinutes(userId);
 
     // Start processing in background
-    processTranslation(jobId, youtubeUrl, userId, duration, metadata.title);
+    processTranslation(jobId, youtubeUrl, userId, metadata);
 
     // Return immediately
     res.status(202).json({
@@ -277,6 +284,7 @@ router.get('/status/:jobId', (req, res) => {
   if (job.status === 'complete') {
     response.transcript = job.transcript;
     response.duration = job.duration;
+    response.source = job.source;
     if (job.minutes_used !== undefined) {
       response.minutes_used = job.minutes_used;
       response.minutes_remaining = job.minutes_remaining;
@@ -292,66 +300,161 @@ router.get('/status/:jobId', (req, res) => {
 });
 
 /**
- * Process translation - SIMPLIFIED
- * No lyrics database, no scraping, just: Download → Transcribe → Translate
+ * Process translation
+ * Tries LRCLIB first (fast), falls back to Whisper (slow)
  */
-async function processTranslation(jobId, youtubeUrl, userId, duration, videoTitle) {
+async function processTranslation(jobId, youtubeUrl, userId, metadata) {
   let audioFilePath = null;
+  let source = 'unknown';
 
   try {
-    // Step 1: Download audio
-    console.log(`[JOB ${jobId}] Downloading audio...`);
-    jobManager.updateJob(jobId, 'downloading', 30);
+    // Step 1: Try LRCLIB first (free, fast)
+    console.log(`[JOB ${jobId}] Trying LRCLIB...`);
+    jobManager.updateJob(jobId, 'processing', 20);
 
-    audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
-    console.log(`[JOB ${jobId}] Audio downloaded: ${audioFilePath}`);
+    const cleanTitle = lrclib.cleanTitle(metadata.title);
+    const artist = lrclib.parseArtist(metadata.title);
+    console.log(`[JOB ${jobId}] Parsed: "${cleanTitle}" by "${artist || 'unknown'}"`);
 
-    jobManager.updateJob(jobId, 'transcribing', 50);
+    const lrcResult = await lrclib.searchLyrics(cleanTitle, artist, metadata.duration);
 
-    // Step 2: Transcribe and translate
-    console.log(`[JOB ${jobId}] Transcribing and translating...`);
+    let transcript = null;
 
-    const transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
-      videoTitle: videoTitle
-    });
+    if (lrcResult && (lrcResult.syncedLyrics || lrcResult.plainLyrics)) {
+      // LRCLIB found lyrics!
+      console.log(`[JOB ${jobId}] ✓ LRCLIB found lyrics`);
+      source = 'lrclib';
+      jobManager.updateJob(jobId, 'processing', 40);
 
-    console.log(`[JOB ${jobId}] Got ${transcript.length} segments`);
-    jobManager.updateJob(jobId, 'transcribing', 90);
+      // Parse into segments
+      let segments;
+      if (lrcResult.syncedLyrics) {
+        segments = lrclib.parseSyncedLyrics(lrcResult.syncedLyrics);
+      } else {
+        segments = lrclib.parsePlainLyrics(lrcResult.plainLyrics, metadata.duration);
+      }
 
-    // Step 3: Deduct usage
+      // Translate segments to English
+      jobManager.updateJob(jobId, 'processing', 60);
+      transcript = await translateSegments(segments, cleanTitle);
+
+    } else {
+      // Fallback to Whisper
+      console.log(`[JOB ${jobId}] LRCLIB: not found, using Whisper...`);
+      source = 'whisper';
+      jobManager.updateJob(jobId, 'downloading', 30);
+
+      audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
+      console.log(`[JOB ${jobId}] Audio downloaded: ${audioFilePath}`);
+      jobManager.updateJob(jobId, 'transcribing', 50);
+
+      transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
+        videoTitle: metadata.title
+      });
+    }
+
+    console.log(`[JOB ${jobId}] Got ${transcript.length} segments (source: ${source})`);
+    jobManager.updateJob(jobId, 'processing', 90);
+
+    // Deduct usage
     let usageInfo = { minutes_used: 0, minutes_remaining: 0 };
     if (userId) {
       try {
-        usageInfo = await userStorage.deductMinutes(userId, duration);
-        console.log(`[JOB ${jobId}] Deducted ${Math.ceil(duration / 60)} minutes`);
+        usageInfo = await userStorage.deductMinutes(userId, metadata.duration);
+        console.log(`[JOB ${jobId}] Deducted ${Math.ceil(metadata.duration / 60)} minutes`);
       } catch (e) {
-        console.error(`[JOB ${jobId}] Usage tracking error:`, e.message);
+        console.error(`[JOB ${jobId}] Usage error:`, e.message);
       }
     }
 
-    // Step 4: Complete
+    // Complete
     const job = jobManager.getJob(jobId);
-    jobManager.completeJob(jobId, transcript, duration);
+    jobManager.completeJob(jobId, transcript, metadata.duration);
     job.minutes_used = usageInfo.minutes_used;
     job.minutes_remaining = usageInfo.minutes_remaining;
+    job.source = source;
 
-    console.log(`[JOB ${jobId}] Complete!`);
+    console.log(`[JOB ${jobId}] ✓ Complete (${source})`);
 
   } catch (error) {
     console.error(`[JOB ${jobId}] Error:`, error.message);
     jobManager.failJob(jobId, error.message);
-
   } finally {
-    // Cleanup audio file
     if (audioFilePath) {
-      try {
-        await fs.unlink(audioFilePath);
-        console.log(`[JOB ${jobId}] Cleaned up audio file`);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
+      try { await fs.unlink(audioFilePath); } catch (e) {}
     }
   }
+}
+
+/**
+ * Translate LRCLIB segments to English
+ */
+async function translateSegments(segments, songTitle) {
+  if (!segments.length) return [];
+
+  const allText = segments.map(s => s.text).join('\n');
+
+  // Check if Devanagari - transliterate first
+  let romanized = allText;
+  if (/[\u0900-\u097F]/.test(allText)) {
+    console.log('[TRANSLATE] Transliterating Devanagari...');
+    romanized = await transliterate(allText);
+  }
+
+  // Translate to English
+  console.log('[TRANSLATE] Translating to English...');
+  const english = await translateToEnglish(romanized, songTitle);
+
+  const romanizedLines = romanized.split('\n').filter(l => l.trim());
+  const englishLines = english.split('\n').filter(l => l.trim());
+
+  return segments.map((seg, i) => ({
+    id: i,
+    start: seg.start,
+    end: seg.end,
+    romanized: romanizedLines[i]?.trim() || seg.text,
+    english: englishLines[i]?.trim() || '',
+    text: englishLines[i]?.trim() || romanizedLines[i]?.trim() || seg.text
+  }));
+}
+
+/**
+ * Transliterate Devanagari to romanized Hindi
+ */
+async function transliterate(text) {
+  const response = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      {
+        role: 'system',
+        content: `Convert Devanagari to romanized Hindi. Output ONLY the romanized text.
+Examples: तुम ही हो → Tum hi ho, दिल तो पागल है → Dil to pagal hai`
+      },
+      { role: 'user', content: text }
+    ],
+    temperature: 0.1,
+    max_tokens: 4000
+  });
+  return response.choices[0].message.content.trim();
+}
+
+/**
+ * Translate romanized Hindi to English
+ */
+async function translateToEnglish(text, songTitle) {
+  const response = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      {
+        role: 'system',
+        content: `Translate Hindi lyrics to natural English. Keep same line count. Output ONLY translation.`
+      },
+      { role: 'user', content: `Translate "${songTitle}":\n\n${text}` }
+    ],
+    temperature: 0.3,
+    max_tokens: 4000
+  });
+  return response.choices[0].message.content.trim();
 }
 
 module.exports = router;

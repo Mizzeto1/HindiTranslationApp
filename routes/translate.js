@@ -315,15 +315,10 @@ async function processTranslation(jobId, youtubeUrl, userId, metadata) {
 
     // Clean the title for LRCLIB search
     const cleanedTitle = lrclib.cleanTitle(metadata.title);
-    const coreTitle = lrclib.extractCoreSongName(metadata.title);
     const artist = lrclib.parseArtist(metadata.title);
 
-    console.log(`[JOB ${jobId}] Cleaned title: "${cleanedTitle}"`);
-    console.log(`[JOB ${jobId}] Core title: "${coreTitle}"`);
-    console.log(`[JOB ${jobId}] Artist: "${artist || '(not detected)'}"`);
-
-    // Search LRCLIB - it will try multiple strategies internally
-    const lrcResult = await lrclib.searchLyrics(coreTitle, artist);
+    // Search LRCLIB with validated results
+    const lrcResult = await lrclib.searchLyrics(cleanedTitle, artist);
 
     let transcript = null;
 
@@ -343,7 +338,7 @@ async function processTranslation(jobId, youtubeUrl, userId, metadata) {
 
       // Translate segments to English
       jobManager.updateJob(jobId, 'processing', 60);
-      transcript = await translateSegments(segments, coreTitle);
+      transcript = await translateSegments(segments, cleanedTitle);
 
     } else {
       // Fallback to Whisper

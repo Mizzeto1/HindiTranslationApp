@@ -8,33 +8,148 @@
 const USER_AGENT = 'BollyLearn/1.0';
 
 /**
- * Search LRCLIB for lyrics using multiple strategies
+ * Clean song title - remove YouTube junk but KEEP the song name
  */
-async function searchLyrics(trackName, artistName = null, duration = null) {
+function cleanTitle(title) {
+  let cleaned = title
+    // Remove common VIDEO TYPE prefixes
+    .replace(/^(Lyrical|Official|Full)\s*[:|-]\s*/gi, '')
+    .replace(/^(Official\s+)?(Music\s+)?(Video|Audio|Lyric[s]?)\s*[:|-]\s*/gi, '')
+    .replace(/^(Full\s+)?(Video\s+)?(Song|Audio)\s*[:|-]\s*/gi, '')
+
+    // Remove everything after |
+    .replace(/\s*\|.*$/g, '')
+
+    // Remove parenthetical junk
+    .replace(/\s*\((Official|Full|Lyric|Audio|Video|HD|4K|HQ|From).*?\)/gi, '')
+
+    // Remove bracketed junk
+    .replace(/\s*\[.*?\]/g, '')
+
+    // Remove trailing indicators
+    .replace(/\s*-\s*(Official|Full|HD|4K|HQ|Audio|Video|Lyric[s]?).*$/gi, '')
+
+    // Clean whitespace
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Safety: if too short, try simpler approach
+  if (cleaned.length < 3) {
+    cleaned = title.replace(/\s*\|.*$/, '').replace(/\s*\(.*?\)/g, '').replace(/\s*\[.*?\]/g, '').trim();
+  }
+  if (cleaned.length < 3) {
+    cleaned = title.split('|')[0].trim();
+  }
+
+  console.log(`[LRCLIB] cleanTitle: "${title.substring(0, 60)}${title.length > 60 ? '...' : ''}" → "${cleaned}"`);
+  return cleaned;
+}
+
+/**
+ * Extract artist - returns null if not confident
+ */
+function parseArtist(title) {
+  // For Bollywood: "Song | Movie | Actors" - singer NOT in title
+  // Only extract if very clear pattern
+
+  const patterns = [
+    /\bby\s+([A-Za-z\s]{3,40})(?:\s*[-|(\[]|$)/i,
+    /\b(?:ft\.?|feat\.?)\s+([A-Za-z\s]{3,40})(?:\s*[-|(\[]|$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = title.match(pattern);
+    if (match) {
+      const artist = match[1].trim();
+      if (artist.length > 2) {
+        console.log(`[LRCLIB] Extracted artist: "${artist}"`);
+        return artist;
+      }
+    }
+  }
+
+  console.log(`[LRCLIB] No artist extracted (searching by title only)`);
+  return null;
+}
+
+/**
+ * Validate that LRCLIB result matches our search
+ */
+function isRelevantResult(searchQuery, result) {
+  if (!result || !result.trackName) return false;
+
+  const queryLower = searchQuery.toLowerCase();
+  const resultLower = result.trackName.toLowerCase();
+
+  const stopWords = ['the', 'and', 'for', 'with', 'from', 'song', 'full', 'video', 'audio', 'lyric', 'lyrics', 'official'];
+
+  const queryWords = queryLower.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
+  const resultWords = resultLower.split(/\s+/).filter(w => w.length > 2 && !stopWords.includes(w));
+
+  if (queryWords.length === 0) return true;
+
+  const hasMatch = queryWords.some(qw => resultWords.some(rw => rw.includes(qw) || qw.includes(rw)));
+
+  if (!hasMatch) {
+    console.log(`[LRCLIB] ✗ Rejecting: searched "${searchQuery}", got "${result.trackName}"`);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Search LRCLIB with validation
+ */
+async function searchLyrics(trackName, artistName, duration = null) {
   console.log(`[LRCLIB] Searching: "${trackName}"${artistName ? ` by "${artistName}"` : ''}`);
 
   try {
-    // Strategy 1: Try with full cleaned title using q parameter (most flexible)
-    let result = await searchWithQuery(trackName);
-    if (result) return result;
+    const params = new URLSearchParams({ track_name: trackName });
+    if (artistName) params.append('artist_name', artistName);
+    if (duration) params.append('duration', Math.round(duration));
 
-    // Strategy 2: Try with just the core song name (more aggressive cleaning)
-    const coreName = extractCoreSongName(trackName);
-    if (coreName && coreName !== trackName) {
-      console.log(`[LRCLIB] Trying core name: "${coreName}"`);
-      result = await searchWithQuery(coreName);
-      if (result) return result;
+    // Try exact match
+    let response = await fetch(`https://lrclib.net/api/get?${params}`, {
+      headers: { 'User-Agent': USER_AGENT }
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data && (data.plainLyrics || data.syncedLyrics) && isRelevantResult(trackName, data)) {
+        console.log(`[LRCLIB] ✓ Exact match: "${data.trackName}" by "${data.artistName}"`);
+        return data;
+      }
     }
 
-    // Strategy 3: If we have artist, try combining core name + artist
-    if (artistName) {
-      const queryWithArtist = `${coreName || trackName} ${artistName}`;
-      console.log(`[LRCLIB] Trying with artist: "${queryWithArtist}"`);
-      result = await searchWithQuery(queryWithArtist);
-      if (result) return result;
+    // Try search
+    response = await fetch(`https://lrclib.net/api/search?${params}`, {
+      headers: { 'User-Agent': USER_AGENT }
+    });
+
+    if (response.ok) {
+      const results = await response.json();
+      if (Array.isArray(results)) {
+        for (const result of results) {
+          if (isRelevantResult(trackName, result)) {
+            console.log(`[LRCLIB] ✓ Search match: "${result.trackName}" by "${result.artistName}"`);
+
+            if (!result.plainLyrics && !result.syncedLyrics && result.id) {
+              const full = await fetch(`https://lrclib.net/api/get/${result.id}`, {
+                headers: { 'User-Agent': USER_AGENT }
+              });
+              if (full.ok) return await full.json();
+            }
+            return result;
+          }
+        }
+        if (results.length > 0) {
+          console.log(`[LRCLIB] All ${results.length} results were irrelevant`);
+        }
+      }
     }
 
-    console.log(`[LRCLIB] No results found`);
+    console.log(`[LRCLIB] No relevant results found`);
     return null;
 
   } catch (error) {
@@ -44,48 +159,7 @@ async function searchLyrics(trackName, artistName = null, duration = null) {
 }
 
 /**
- * Search using the q parameter (full-text search)
- */
-async function searchWithQuery(query) {
-  // Use 'q' parameter for flexible full-text search
-  const searchUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`;
-
-  const response = await fetch(searchUrl, {
-    headers: { 'User-Agent': USER_AGENT }
-  });
-
-  if (!response.ok) {
-    console.log(`[LRCLIB] Search failed: ${response.status}`);
-    return null;
-  }
-
-  const results = await response.json();
-
-  if (!Array.isArray(results) || results.length === 0) {
-    return null;
-  }
-
-  // Find best result (prefer one with synced lyrics)
-  let best = results.find(r => r.syncedLyrics) || results[0];
-  console.log(`[LRCLIB] ✓ Found: "${best.trackName}" by "${best.artistName}"`);
-
-  // Fetch full lyrics if not included
-  if (!best.plainLyrics && !best.syncedLyrics && best.id) {
-    console.log(`[LRCLIB] Fetching full lyrics for id: ${best.id}`);
-    const fullResponse = await fetch(`https://lrclib.net/api/get/${best.id}`, {
-      headers: { 'User-Agent': USER_AGENT }
-    });
-    if (fullResponse.ok) {
-      return await fullResponse.json();
-    }
-  }
-
-  return best;
-}
-
-/**
  * Parse synced lyrics (LRC format) into segments
- * "[00:27.93] Line one\n[00:32.45] Line two" → [{ start, end, text }]
  */
 function parseSyncedLyrics(syncedLyrics) {
   if (!syncedLyrics) return [];
@@ -111,9 +185,7 @@ function parseSyncedLyrics(syncedLyrics) {
 
   // Set end times
   for (let i = 0; i < segments.length; i++) {
-    segments[i].end = (i < segments.length - 1)
-      ? segments[i + 1].start
-      : segments[i].start + 5;
+    segments[i].end = (i < segments.length - 1) ? segments[i + 1].start : segments[i].start + 5;
   }
 
   console.log(`[LRCLIB] Parsed ${segments.length} synced segments`);
@@ -121,7 +193,7 @@ function parseSyncedLyrics(syncedLyrics) {
 }
 
 /**
- * Parse plain lyrics into segments with estimated timestamps
+ * Parse plain lyrics with estimated timestamps
  */
 function parsePlainLyrics(plainLyrics, duration) {
   if (!plainLyrics) return [];
@@ -140,108 +212,10 @@ function parsePlainLyrics(plainLyrics, duration) {
   return segments;
 }
 
-/**
- * Clean song title - remove common YouTube noise
- */
-function cleanTitle(title) {
-  return title
-    // Remove content in parentheses
-    .replace(/\s*\(official.*?\)/gi, '')
-    .replace(/\s*\(lyric.*?\)/gi, '')
-    .replace(/\s*\(audio.*?\)/gi, '')
-    .replace(/\s*\(full.*?\)/gi, '')
-    .replace(/\s*\(hd.*?\)/gi, '')
-    .replace(/\s*\(4k.*?\)/gi, '')
-    .replace(/\s*\(from.*?\)/gi, '')
-    // Remove content in brackets
-    .replace(/\s*\[.*?\]/g, '')
-    // Remove everything after pipe
-    .replace(/\s*\|.*$/g, '')
-    // Remove common suffixes
-    .replace(/\s*-\s*(official|full|hd|4k|lyric|audio|video).*$/gi, '')
-    // Remove "Full Video Song", "Video Song", etc.
-    .replace(/\s*(full\s+)?(video\s+)?song(\s+video)?/gi, '')
-    .replace(/\s+full\s+video$/gi, '')
-    .replace(/\s+video$/gi, '')
-    .replace(/\s+audio$/gi, '')
-    .replace(/\s+hd$/gi, '')
-    .replace(/\s+4k$/gi, '')
-    // Clean up whitespace
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-/**
- * Extract just the core song name (most aggressive cleaning)
- * For "Tum Hi Ho Full Video Song Aashiqui 2" → "Tum Hi Ho"
- */
-function extractCoreSongName(title) {
-  let cleaned = title
-    // Remove everything in parentheses and brackets
-    .replace(/\s*\(.*?\)/g, '')
-    .replace(/\s*\[.*?\]/g, '')
-    // Remove everything after pipe or dash
-    .replace(/\s*\|.*$/g, '')
-    .replace(/\s*-.*$/g, '')
-    // Remove common noise words and what follows
-    .replace(/\s+(full|video|song|audio|lyric|official|hd|4k|from|feat|ft)(\s+.*)?$/gi, '')
-    // Remove movie names that follow song titles (common Bollywood pattern)
-    // These are usually 1-3 word proper nouns after the song
-    .replace(/\s+[A-Z][a-z]+(\s+[A-Z][a-z]+){0,2}\s*$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // If we cleaned too much, return original cleaned version
-  if (cleaned.length < 3) {
-    return cleanTitle(title);
-  }
-
-  return cleaned;
-}
-
-/**
- * Try to extract artist from YouTube title
- * Note: This is unreliable for Bollywood as titles often list actors, not singers
- */
-function parseArtist(title) {
-  // Look for common patterns where singer name appears
-  const patterns = [
-    // "Song | Singer | Movie" - singer between pipes
-    /\|\s*([^|]+?)\s*\|/,
-    // "Song | Singer" - singer after single pipe (if no movie)
-    /\|\s*([^|]+?)\s*$/,
-    // "Song - Singer" - singer after dash
-    /-\s*([^-|(]+?)\s*(?:[-|(]|$)/,
-  ];
-
-  for (const pattern of patterns) {
-    const match = title.match(pattern);
-    if (match) {
-      let artist = match[1]
-        .replace(/\s*(official|video|audio|lyrics|full|hd|4k).*$/i, '')
-        .trim();
-
-      // Skip if it looks like a movie name (contains numbers like "2" or common movie words)
-      if (/\d/.test(artist) || /^(the|a|an)\s/i.test(artist)) {
-        continue;
-      }
-
-      // Skip very short or very long matches
-      if (artist.length > 2 && artist.length < 40) {
-        return artist;
-      }
-    }
-  }
-
-  return null;
-}
-
 module.exports = {
   searchLyrics,
-  searchWithQuery,
   parseSyncedLyrics,
   parsePlainLyrics,
   cleanTitle,
-  extractCoreSongName,
   parseArtist
 };

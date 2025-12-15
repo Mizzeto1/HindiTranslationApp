@@ -1,293 +1,133 @@
 /**
- * YouTube Service
+ * YouTube Service - SIMPLIFIED
  *
- * Handles downloading audio from YouTube videos using yt-dlp.
+ * Does THREE things:
+ * 1. Search YouTube (for /api/search-songs) - KEEP AS-IS
+ * 2. Get video metadata (title, duration)
+ * 3. Download audio
  */
 
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const path = require('path');
-const fs = require('fs').promises;
-const fsSync = require('fs');
-const util = require('util');
-
-const execPromise = util.promisify(exec);
-
-// Temp directory for audio files
-const TEMP_DIR = path.join(__dirname, '..', 'temp');
-
-// Local bin directory for yt-dlp
-const LOCAL_BIN = path.join(__dirname, '..', 'bin', 'yt-dlp');
+const fs = require('fs');
+const os = require('os');
 
 /**
- * Get the yt-dlp command path - prefers local bin, falls back to system PATH
+ * Get video metadata
  */
-function getYtDlpPath() {
-  // Check if local binary exists
-  if (fsSync.existsSync(LOCAL_BIN)) {
-    console.log('[YOUTUBE] Using local yt-dlp:', LOCAL_BIN);
-    return LOCAL_BIN;
-  }
-  // Fall back to system PATH
-  console.log('[YOUTUBE] Using system yt-dlp');
-  return 'yt-dlp';
-}
-
-/**
- * Check if yt-dlp is installed on the system
- * @returns {Promise<boolean>} True if yt-dlp is installed
- */
-async function checkYtDlpInstalled() {
-  const ytdlp = getYtDlpPath();
-  try {
-    const { stdout } = await execPromise(`"${ytdlp}" --version`);
-    console.log(`[YOUTUBE] yt-dlp is installed, version: ${stdout.trim()}`);
-    return true;
-  } catch (error) {
-    console.error('[YOUTUBE] yt-dlp is not installed:', error.message);
-    return false;
-  }
-}
-
-/**
- * Get the duration of a YouTube video in seconds
- * @param {string} youtubeUrl - The YouTube URL
- * @returns {Promise<number>} Duration in seconds
- */
-async function getVideoDuration(youtubeUrl) {
-  const ytdlp = getYtDlpPath();
-  try {
-    console.log('[YOUTUBE] Getting video duration...');
-
-    const { stdout } = await execPromise(
-      `"${ytdlp}" --get-duration "${youtubeUrl}"`,
-      { timeout: 30000 }
-    );
-
-    const durationStr = stdout.trim();
-    console.log(`[YOUTUBE] Raw duration: ${durationStr}`);
-
-    // Parse duration string (formats: "MM:SS", "HH:MM:SS", or just seconds)
-    const parts = durationStr.split(':').map(Number);
-    let seconds = 0;
-
-    if (parts.length === 3) {
-      // HH:MM:SS
-      seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
-    } else if (parts.length === 2) {
-      // MM:SS
-      seconds = parts[0] * 60 + parts[1];
-    } else {
-      // Just seconds
-      seconds = parts[0];
-    }
-
-    console.log(`[YOUTUBE] Parsed duration: ${seconds} seconds`);
-    return seconds;
-
-  } catch (error) {
-    console.error('[YOUTUBE] Error getting duration:', error.message);
-    console.error('[YOUTUBE] Duration error details:', error.stderr || error.stack || '(no details)');
-
-    // Try to provide a more specific error message
-    const errorStr = String(error.message || error.stderr || '').toLowerCase();
-    if (errorStr.includes('unavailable') || errorStr.includes('private')) {
-      throw new Error('Video is unavailable or private');
-    } else if (errorStr.includes('age') || errorStr.includes('sign in')) {
-      throw new Error('Video is age-restricted');
-    } else if (errorStr.includes('not found') || errorStr.includes('404')) {
-      throw new Error('Video not found. Please check the URL.');
-    }
-
-    // If we can't get duration, assume it's acceptable (will fail later if too long)
-    console.log('[YOUTUBE] Proceeding without duration check');
-    return 0;
-  }
-}
-
-/**
- * Download audio from a YouTube video
- * @param {string} youtubeUrl - The YouTube URL
- * @param {string} jobId - The job ID for naming the file
- * @returns {Promise<string>} Path to the downloaded audio file
- */
-async function downloadAudio(youtubeUrl, jobId) {
-  const ytdlp = getYtDlpPath();
-
-  // Ensure temp directory exists
-  try {
-    await fs.mkdir(TEMP_DIR, { recursive: true });
-  } catch (err) {
-    // Directory might already exist, that's fine
-  }
-
-  // Use template for output, yt-dlp will add the correct extension
-  const outputTemplate = path.join(TEMP_DIR, `${jobId}.%(ext)s`);
-  const expectedPath = path.join(TEMP_DIR, jobId);
-
-  console.log(`[YOUTUBE] Downloading audio from: ${youtubeUrl}`);
-  console.log(`[YOUTUBE] Output template: ${outputTemplate}`);
+async function getVideoMetadata(youtubeUrl) {
+  console.log('[YOUTUBE] Getting metadata for:', youtubeUrl);
 
   return new Promise((resolve, reject) => {
-    // yt-dlp command to extract audio (keep original format, no conversion needed)
     const args = [
-      '-x',                          // Extract audio
-      '-f', 'bestaudio[ext=m4a]/bestaudio',  // Prefer m4a, fallback to best
-      '-o', outputTemplate,          // Output path template
-      '--no-playlist',               // Don't download playlists
-      '--no-warnings',               // Suppress warnings
+      '--dump-json',
+      '--no-playlist',
+      '--no-warnings',
       youtubeUrl
     ];
 
-    console.log(`[YOUTUBE] Running: ${ytdlp} ${args.join(' ')}`);
-
-    const ytProcess = spawn(ytdlp, args);
-
+    const proc = spawn('yt-dlp', args);
     let stdout = '';
     let stderr = '';
 
-    ytProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      stdout += output;
-      // Log download progress
-      if (output.includes('%')) {
-        console.log(`[YOUTUBE] ${output.trim()}`);
+    proc.stdout.on('data', (data) => { stdout += data; });
+    proc.stderr.on('data', (data) => { stderr += data; });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        console.error('[YOUTUBE] Metadata error:', stderr);
+        return reject(new Error('Failed to get video info'));
+      }
+
+      try {
+        const info = JSON.parse(stdout);
+        const metadata = {
+          title: info.title || 'Unknown',
+          duration: info.duration || 0,
+          channel: info.channel || info.uploader || 'Unknown'
+        };
+        console.log('[YOUTUBE] Metadata:', metadata.title, '(' + metadata.duration + 's)');
+        resolve(metadata);
+      } catch (e) {
+        reject(new Error('Failed to parse video info'));
       }
     });
-
-    ytProcess.stderr.on('data', (data) => {
-      stderr += data.toString();
-    });
-
-    ytProcess.on('close', async (code) => {
-      if (code === 0) {
-        // Find the downloaded file (could be .m4a, .webm, .opus, etc.)
-        try {
-          const files = await fs.readdir(TEMP_DIR);
-          const audioFile = files.find(f => f.startsWith(jobId));
-
-          if (audioFile) {
-            const finalPath = path.join(TEMP_DIR, audioFile);
-            console.log(`[YOUTUBE] Download complete: ${finalPath}`);
-            resolve(finalPath);
-          } else {
-            reject(new Error('Audio file not found after download'));
-          }
-        } catch (err) {
-          reject(new Error('Audio file not found after download'));
-        }
-      } else {
-        console.error(`[YOUTUBE] yt-dlp failed with code ${code}`);
-        console.error(`[YOUTUBE] stderr: ${stderr}`);
-        console.error(`[YOUTUBE] stdout: ${stdout}`);
-
-        // Parse common errors with more specific messages
-        const stderrLower = stderr.toLowerCase();
-        const stdoutLower = stdout.toLowerCase();
-        const combined = stderrLower + stdoutLower;
-
-        if (combined.includes('video unavailable') || combined.includes('private video')) {
-          reject(new Error('Video is unavailable or private. Please check the URL.'));
-        } else if (combined.includes('sign in to confirm your age') || combined.includes('age-restricted')) {
-          reject(new Error('Video is age-restricted and cannot be downloaded.'));
-        } else if (combined.includes('copyright') || combined.includes('blocked')) {
-          reject(new Error('Video is blocked due to copyright restrictions.'));
-        } else if (combined.includes('premiere') || combined.includes('upcoming')) {
-          reject(new Error('Video is an upcoming premiere and not yet available.'));
-        } else if (combined.includes('members only') || combined.includes('member-only')) {
-          reject(new Error('Video is for channel members only.'));
-        } else if (combined.includes('geo restriction') || combined.includes('not available in your country')) {
-          reject(new Error('Video is not available in this region.'));
-        } else if (combined.includes('removed') || combined.includes('deleted')) {
-          reject(new Error('Video has been removed or deleted.'));
-        } else if (combined.includes('network') || combined.includes('connection')) {
-          reject(new Error('Network error while downloading video. Please try again.'));
-        } else if (combined.includes('http error 403') || combined.includes('forbidden')) {
-          reject(new Error('Access to video is forbidden. It may be private or region-locked.'));
-        } else if (combined.includes('http error 404') || combined.includes('not found')) {
-          reject(new Error('Video not found. Please check the URL.'));
-        } else {
-          // Include first 200 chars of error for debugging
-          const errorSnippet = stderr.slice(0, 200) || 'Unknown error';
-          reject(new Error(`Failed to download: ${errorSnippet}`));
-        }
-      }
-    });
-
-    ytProcess.on('error', (error) => {
-      console.error('[YOUTUBE] Process error:', error);
-      reject(new Error(`Failed to start yt-dlp: ${error.message}`));
-    });
-
-    // Timeout after 5 minutes
-    setTimeout(() => {
-      ytProcess.kill();
-      reject(new Error('Download timed out after 5 minutes'));
-    }, 300000);
   });
 }
 
 /**
- * Clean up a downloaded audio file
- * @param {string} filePath - Path to the file to delete
+ * Download audio from YouTube
  */
-async function cleanupAudioFile(filePath) {
-  try {
-    await fs.unlink(filePath);
-    console.log(`[YOUTUBE] Deleted: ${filePath}`);
-  } catch (error) {
-    console.error(`[YOUTUBE] Failed to delete ${filePath}:`, error.message);
-  }
+async function downloadAudio(youtubeUrl, jobId) {
+  console.log('[YOUTUBE] Downloading audio for job:', jobId);
+
+  const tempDir = os.tmpdir();
+  const outputPath = path.join(tempDir, `${jobId}.m4a`);
+
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-x',                              // Extract audio
+      '-f', 'bestaudio[ext=m4a]/bestaudio',
+      '-o', outputPath,
+      '--no-playlist',
+      '--no-warnings',
+      '--max-filesize', '25M',           // Limit file size
+      youtubeUrl
+    ];
+
+    console.log('[YOUTUBE] Running yt-dlp...');
+    const proc = spawn('yt-dlp', args);
+    let stderr = '';
+
+    proc.stderr.on('data', (data) => { stderr += data; });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        console.error('[YOUTUBE] Download error:', stderr);
+        return reject(new Error('Failed to download audio'));
+      }
+
+      // Find the actual output file (extension might vary)
+      const possibleExtensions = ['.m4a', '.webm', '.mp3', '.opus'];
+      let actualPath = outputPath;
+
+      for (const ext of possibleExtensions) {
+        const testPath = outputPath.replace('.m4a', ext);
+        if (fs.existsSync(testPath)) {
+          actualPath = testPath;
+          break;
+        }
+      }
+
+      if (!fs.existsSync(actualPath)) {
+        // Check without extension replacement
+        const basePath = outputPath.replace('.m4a', '');
+        for (const ext of possibleExtensions) {
+          if (fs.existsSync(basePath + ext)) {
+            actualPath = basePath + ext;
+            break;
+          }
+        }
+      }
+
+      if (!fs.existsSync(actualPath)) {
+        return reject(new Error('Audio file not found after download'));
+      }
+
+      console.log('[YOUTUBE] Downloaded:', actualPath);
+      resolve(actualPath);
+    });
+  });
 }
 
 /**
- * Get video metadata (title, channel, etc.)
- * @param {string} youtubeUrl - The YouTube URL
- * @returns {Promise<{title: string, channel: string, description: string}>}
+ * Search YouTube (for search feature)
  */
-async function getVideoMetadata(youtubeUrl) {
-  const ytdlp = getYtDlpPath();
-  try {
-    console.log('[YOUTUBE] Getting video metadata...');
+async function searchYouTube(query, maxResults = 10) {
+  console.log('[YOUTUBE] Searching:', query);
 
-    const { stdout } = await execPromise(
-      `"${ytdlp}" --dump-json --no-download "${youtubeUrl}"`,
-      { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
-    );
-
-    const metadata = JSON.parse(stdout);
-
-    const result = {
-      title: metadata.title || '',
-      channel: metadata.channel || metadata.uploader || '',
-      description: metadata.description || '',
-      tags: metadata.tags || []
-    };
-
-    console.log(`[YOUTUBE] Video title: ${result.title}`);
-    console.log(`[YOUTUBE] Channel: ${result.channel}`);
-
-    return result;
-
-  } catch (error) {
-    console.error('[YOUTUBE] Error getting metadata:', error.message);
-    return {
-      title: '',
-      channel: '',
-      description: '',
-      tags: []
-    };
-  }
-}
-
-/**
- * Search YouTube using the Data API (if key provided) or yt-dlp fallback
- * @param {string} query - Search query
- * @param {number} maxResults - Maximum results to return (default 5)
- * @returns {Promise<Array>} Array of video results
- */
-async function searchYouTube(query, maxResults = 5) {
+  // Use YouTube API if available
   const apiKey = process.env.YOUTUBE_API_KEY;
-
   if (apiKey) {
     try {
       return await searchWithApi(query, maxResults, apiKey);
@@ -296,8 +136,48 @@ async function searchYouTube(query, maxResults = 5) {
     }
   }
 
-  // Fallback to yt-dlp search
-  return await searchWithYtDlp(query, maxResults);
+  return new Promise((resolve, reject) => {
+    const args = [
+      `ytsearch${maxResults}:${query} hindi song`,
+      '--dump-json',
+      '--flat-playlist',
+      '--no-warnings'
+    ];
+
+    const proc = spawn('yt-dlp', args);
+    let stdout = '';
+
+    proc.stdout.on('data', (data) => { stdout += data; });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        return resolve([]);  // Return empty on error
+      }
+
+      try {
+        const results = stdout
+          .trim()
+          .split('\n')
+          .filter(line => line.trim())
+          .map(line => {
+            const data = JSON.parse(line);
+            return {
+              id: data.id,
+              title: data.title,
+              url: `https://www.youtube.com/watch?v=${data.id}`,
+              duration: data.duration,
+              channel: data.channel || data.uploader
+            };
+          })
+          .filter(r => r.id && r.title);
+
+        console.log('[YOUTUBE] Found', results.length, 'results');
+        resolve(results);
+      } catch (e) {
+        resolve([]);
+      }
+    });
+  });
 }
 
 /**
@@ -310,7 +190,7 @@ async function searchWithApi(query, maxResults, apiKey) {
   url.searchParams.set('part', 'snippet');
   url.searchParams.set('type', 'video');
   url.searchParams.set('videoCategoryId', '10'); // Music category
-  url.searchParams.set('q', query);
+  url.searchParams.set('q', query + ' hindi song');
   url.searchParams.set('maxResults', maxResults.toString());
   url.searchParams.set('key', apiKey);
 
@@ -329,63 +209,19 @@ async function searchWithApi(query, maxResults, apiKey) {
   }
 
   const results = data.items.map(item => ({
-    youtubeId: item.id.videoId,
+    id: item.id.videoId,
     title: item.snippet.title,
+    url: `https://www.youtube.com/watch?v=${item.id.videoId}`,
     channel: item.snippet.channelTitle,
-    thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url,
-    publishedAt: item.snippet.publishedAt
+    thumbnail: item.snippet.thumbnails?.medium?.url || item.snippet.thumbnails?.default?.url
   }));
 
   console.log(`[YOUTUBE] API returned ${results.length} results`);
   return results;
 }
 
-/**
- * Search YouTube using yt-dlp (no API key needed, but slower)
- */
-async function searchWithYtDlp(query, maxResults) {
-  const ytdlp = getYtDlpPath();
-  console.log(`[YOUTUBE] Searching with yt-dlp: "${query}"`);
-
-  try {
-    const { stdout } = await execPromise(
-      `"${ytdlp}" "ytsearch${maxResults}:${query}" --dump-json --flat-playlist --no-warnings`,
-      { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
-    );
-
-    // yt-dlp outputs one JSON object per line
-    const lines = stdout.trim().split('\n').filter(line => line.trim());
-    const results = [];
-
-    for (const line of lines) {
-      try {
-        const item = JSON.parse(line);
-        results.push({
-          youtubeId: item.id,
-          title: item.title,
-          channel: item.channel || item.uploader || '',
-          thumbnail: item.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${item.id}/mqdefault.jpg`,
-          publishedAt: null
-        });
-      } catch (parseError) {
-        // Skip malformed lines
-      }
-    }
-
-    console.log(`[YOUTUBE] yt-dlp returned ${results.length} results`);
-    return results;
-
-  } catch (error) {
-    console.error('[YOUTUBE] yt-dlp search error:', error.message);
-    return [];
-  }
-}
-
 module.exports = {
-  checkYtDlpInstalled,
-  getVideoDuration,
-  downloadAudio,
-  cleanupAudioFile,
   getVideoMetadata,
+  downloadAudio,
   searchYouTube
 };

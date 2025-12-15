@@ -1,9 +1,10 @@
 /**
- * Translation Routes
+ * Translation Routes - SIMPLIFIED
  *
- * Handles the translation API endpoints for receiving YouTube URLs
- * and checking job status.
- * Now includes authentication and usage tracking.
+ * Handles the translation API endpoints:
+ * - POST /api/search-songs - Search YouTube (unchanged, works great)
+ * - POST /api/translate - Translate a YouTube video
+ * - GET /api/status/:jobId - Check job status
  */
 
 const express = require('express');
@@ -12,22 +13,12 @@ const { v4: uuidv4 } = require('uuid');
 const jobManager = require('../services/jobManager');
 const youtubeService = require('../services/youtube');
 const transcribeService = require('../services/transcribe');
-const lyricsService = require('../services/lyrics');
 const userStorage = require('../services/userStorage');
 const { requireAuth, getUserEmail } = require('../middleware/auth');
 const fs = require('fs').promises;
 
-// YouTube URL validation regex - supports various formats including browser URLs with extra params
-// Matches: youtube.com/watch?v=xxx, youtu.be/xxx, youtube.com/embed/xxx, youtube.com/v/xxx
-// Also handles: m.youtube.com, music.youtube.com, and URLs with extra parameters (&list=, &t=, etc.)
-const YOUTUBE_URL_REGEX = /^(https?:\/\/)?(www\.|m\.|music\.)?(youtube\.com\/(watch\?v=|embed\/|v\/|shorts\/)|youtu\.be\/)[a-zA-Z0-9_-]{11}/;
-
-// Import lyricsDb for checking cached lyrics
-const lyricsDb = require('../services/lyricsDb');
-
 /**
  * Extract and clean YouTube URL to get just the video
- * Removes playlist params, tracking params, etc.
  * @param {string} url - Raw YouTube URL from user
  * @returns {string} - Clean YouTube URL
  */
@@ -67,7 +58,6 @@ function cleanYouTubeUrl(url) {
       return `https://www.youtube.com/watch?v=${videoId}`;
     }
 
-    // If we can't parse it, return original
     return url;
   } catch (error) {
     console.log('[TRANSLATE] Could not clean URL, using original:', url);
@@ -111,12 +101,9 @@ router.post('/search-songs', async (req, res) => {
 
     console.log(`[SEARCH] Searching for: "${query}"`);
 
-    // Search YouTube (adds "song" to query for better Bollywood results)
-    const searchQuery = `${query} hindi song`;
-
     let results;
     try {
-      results = await youtubeService.searchYouTube(searchQuery, 5);
+      results = await youtubeService.searchYouTube(query, 5);
     } catch (searchError) {
       console.error('[SEARCH] YouTube search error:', searchError.message);
       return res.status(500).json({
@@ -133,43 +120,26 @@ router.post('/search-songs', async (req, res) => {
       });
     }
 
-    // Check which results have cached lyrics (but don't fail if DB is unavailable)
-    let resultsWithLyricsInfo;
-    try {
-      resultsWithLyricsInfo = await Promise.all(
-        results.map(async (result) => {
-          try {
-            const cached = await lyricsDb.getByYoutubeId(result.youtubeId);
-            return {
-              ...result,
-              hasLyrics: !!cached,
-              lyricsSource: cached?.source || null
-            };
-          } catch (dbError) {
-            // If DB check fails, just return result without lyrics info
-            return { ...result, hasLyrics: false, lyricsSource: null };
-          }
-        })
-      );
-    } catch (dbError) {
-      console.error('[SEARCH] Lyrics DB check failed:', dbError.message);
-      // Continue without lyrics info
-      resultsWithLyricsInfo = results.map(r => ({ ...r, hasLyrics: false, lyricsSource: null }));
-    }
+    // Format results
+    const formattedResults = results.map(r => ({
+      youtubeId: r.id,
+      title: r.title,
+      url: r.url,
+      duration: r.duration,
+      channel: r.channel,
+      thumbnail: r.thumbnail || `https://i.ytimg.com/vi/${r.id}/mqdefault.jpg`
+    }));
 
-    // Auto-select: prefer one with cached lyrics, else first result
-    const withLyrics = resultsWithLyricsInfo.find(r => r.hasLyrics);
-    const selected = withLyrics || resultsWithLyricsInfo[0];
-
+    const selected = formattedResults[0];
     console.log(`[SEARCH] Found ${results.length} results, selected: ${selected.title}`);
 
     res.json({
       selected,
-      alternatives: resultsWithLyricsInfo.filter(r => r.youtubeId !== selected.youtubeId)
+      alternatives: formattedResults.slice(1)
     });
 
   } catch (error) {
-    console.error('[SEARCH] Unexpected error:', error.message, error.stack);
+    console.error('[SEARCH] Unexpected error:', error.message);
     res.status(500).json({
       error: 'Search failed',
       message: error.message
@@ -191,7 +161,6 @@ router.post('/translate', requireAuth, async (req, res) => {
 
     // Accept either youtubeUrl or youtubeId
     if (!rawUrl && !youtubeId) {
-      console.log('[TRANSLATE] Error: No YouTube URL or ID provided');
       return res.status(400).json({
         error: 'Missing required field',
         message: 'Either youtubeUrl or youtubeId is required'
@@ -204,81 +173,67 @@ router.post('/translate', requireAuth, async (req, res) => {
       console.log(`[TRANSLATE] Constructed URL from ID: ${rawUrl}`);
     }
 
-    // Try to extract video ID to validate it's a YouTube URL
+    // Validate YouTube URL
     const videoId = extractVideoId(rawUrl);
     if (!videoId) {
-      console.log(`[TRANSLATE] Error: Could not extract video ID from: ${rawUrl}`);
       return res.status(400).json({
         error: 'Invalid URL',
         message: 'Please provide a valid YouTube URL or ID'
       });
     }
 
-    // Clean the URL to remove extra parameters (playlist, tracking, etc.)
     const youtubeUrl = cleanYouTubeUrl(rawUrl);
-    console.log(`[TRANSLATE] Original URL: ${rawUrl}`);
-    console.log(`[TRANSLATE] Cleaned URL: ${youtubeUrl}`);
+    console.log(`[TRANSLATE] Clean URL: ${youtubeUrl}`);
 
-    // Get user email and ensure user exists in storage
+    // Get user email and ensure user exists
     const email = await getUserEmail(userId);
     await userStorage.getOrCreateUser(userId, email);
 
-    // Check if yt-dlp is installed
-    const ytdlpInstalled = await youtubeService.checkYtDlpInstalled();
-    if (!ytdlpInstalled) {
-      console.log('[TRANSLATE] Error: yt-dlp is not installed');
-      return res.status(500).json({
-        error: 'Server configuration error',
-        message: 'yt-dlp is not installed on the server. Please install it first.'
-      });
-    }
-
-    // Check video duration BEFORE processing to verify usage limits
-    console.log(`[TRANSLATE] Checking video duration for usage limits...`);
-    let duration;
+    // Get video metadata (includes duration)
+    console.log(`[TRANSLATE] Getting video metadata...`);
+    let metadata;
     try {
-      duration = await youtubeService.getVideoDuration(youtubeUrl);
-      console.log(`[TRANSLATE] Video duration: ${duration} seconds`);
-    } catch (durationError) {
-      console.log(`[TRANSLATE] Error getting duration: ${durationError.message}`);
+      metadata = await youtubeService.getVideoMetadata(youtubeUrl);
+      console.log(`[TRANSLATE] Title: ${metadata.title}, Duration: ${metadata.duration}s`);
+    } catch (metadataError) {
       return res.status(400).json({
         error: 'Video error',
-        message: durationError.message
+        message: metadataError.message
       });
     }
 
-    // Limit to 15 minutes (900 seconds) per video
+    const duration = metadata.duration;
+
+    // Limit to 15 minutes
     if (duration > 900) {
-      console.log(`[TRANSLATE] Video too long: ${duration} seconds`);
       return res.status(400).json({
         error: 'video_too_long',
-        message: `Video is too long (${Math.round(duration / 60)} minutes). Maximum allowed is 15 minutes per video.`
+        message: `Video is too long (${Math.round(duration / 60)} minutes). Maximum is 15 minutes.`
       });
     }
 
-    // Check user's remaining minutes BEFORE processing
+    // Check usage limits
     const usageCheck = await userStorage.checkUsageLimit(userId, duration);
     if (!usageCheck.canTranslate) {
-      console.log(`[TRANSLATE] Usage limit check failed for user ${userId}`);
       return res.status(403).json(usageCheck.error);
     }
 
-    // Create a new job with user ID
+    // Create job
     const jobId = uuidv4();
     jobManager.createJob(jobId, youtubeUrl);
-    // Store userId with the job for later deduction
     const job = jobManager.getJob(jobId);
     job.userId = userId;
     job.videoDuration = duration;
-    console.log(`[TRANSLATE] Created job: ${jobId} for user: ${userId}`);
+    job.videoTitle = metadata.title;
+    console.log(`[TRANSLATE] Created job: ${jobId}`);
 
-    // Get current usage for response
+    // Get current usage
     const { remaining, used, limit } = await userStorage.getRemainingMinutes(userId);
 
-    // Start processing in background (don't await)
-    processTranslation(jobId, youtubeUrl, userId, duration);
+    // Start processing in background
+    processTranslation(jobId, youtubeUrl, userId, duration, metadata.title);
 
-    // Return job ID immediately with usage info
+    // Return immediately
     res.status(202).json({
       jobId,
       status: 'pending',
@@ -290,7 +245,7 @@ router.post('/translate', requireAuth, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('[TRANSLATE] Unexpected error:', error);
+    console.error('[TRANSLATE] Error:', error);
     res.status(500).json({
       error: 'Server error',
       message: error.message
@@ -304,42 +259,30 @@ router.post('/translate', requireAuth, async (req, res) => {
  */
 router.get('/status/:jobId', (req, res) => {
   const { jobId } = req.params;
-
-  console.log(`[STATUS] Checking status for job: ${jobId}`);
-
   const job = jobManager.getJob(jobId);
 
   if (!job) {
-    console.log(`[STATUS] Job not found: ${jobId}`);
     return res.status(404).json({
       error: 'Job not found',
       message: `No job found with ID: ${jobId}`
     });
   }
 
-  // Build response based on job status
   const response = {
     jobId: job.id,
     status: job.status,
     progress: job.progress
   };
 
-  // Include transcript if complete
   if (job.status === 'complete') {
     response.transcript = job.transcript;
     response.duration = job.duration;
-    // Include transcription source (lyrics_db or groq_fallback)
-    if (job.transcription_source) {
-      response.transcription_source = job.transcription_source;
-    }
-    // Include usage info if available
     if (job.minutes_used !== undefined) {
       response.minutes_used = job.minutes_used;
       response.minutes_remaining = job.minutes_remaining;
     }
   }
 
-  // Include error if failed
   if (job.status === 'error') {
     response.error = job.error;
   }
@@ -349,123 +292,63 @@ router.get('/status/:jobId', (req, res) => {
 });
 
 /**
- * Process the translation job asynchronously
- * Uses lyrics database first, falls back to Groq transcription
- * @param {string} jobId - The job ID
- * @param {string} youtubeUrl - The YouTube URL
- * @param {string} userId - The Clerk user ID
- * @param {number} duration - Video duration in seconds (already validated)
+ * Process translation - SIMPLIFIED
+ * No lyrics database, no scraping, just: Download → Transcribe → Translate
  */
-async function processTranslation(jobId, youtubeUrl, userId, duration) {
+async function processTranslation(jobId, youtubeUrl, userId, duration, videoTitle) {
   let audioFilePath = null;
-  let transcriptionSource = 'groq_fallback'; // Default to Groq
-  let currentStep = 'initializing';
 
   try {
-    // Step 1: Get video metadata for lyrics search
-    currentStep = 'getting_metadata';
-    console.log(`[JOB ${jobId}] Step: ${currentStep} - Getting video metadata...`);
-    jobManager.updateJob(jobId, 'downloading', 10);
+    // Step 1: Download audio
+    console.log(`[JOB ${jobId}] Downloading audio...`);
+    jobManager.updateJob(jobId, 'downloading', 30);
 
-    const metadata = await youtubeService.getVideoMetadata(youtubeUrl);
-    if (!metadata.title) {
-      console.log(`[JOB ${jobId}] Warning: Could not get video title`);
-    }
-    console.log(`[JOB ${jobId}] Video title: ${metadata.title || '(unknown)'}`);
+    audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
+    console.log(`[JOB ${jobId}] Audio downloaded: ${audioFilePath}`);
 
-    // Step 2: Try to find lyrics first
-    currentStep = 'searching_lyrics';
-    console.log(`[JOB ${jobId}] Step: ${currentStep} - Searching for lyrics...`);
-    jobManager.updateJob(jobId, 'downloading', 20);
+    jobManager.updateJob(jobId, 'transcribing', 50);
 
-    let transcript = null;
-    let lyricsResult = { found: false };
+    // Step 2: Transcribe and translate
+    console.log(`[JOB ${jobId}] Transcribing and translating...`);
 
-    try {
-      lyricsResult = await lyricsService.searchLyrics(metadata.title || '', duration, youtubeUrl);
-    } catch (lyricsError) {
-      console.log(`[JOB ${jobId}] Lyrics search error (non-fatal): ${lyricsError.message}`);
-    }
+    const transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
+      videoTitle: videoTitle
+    });
 
-    if (lyricsResult.found) {
-      // Lyrics found! Use them instead of Groq
-      console.log(`[JOB ${jobId}] ✓ LYRICS FOUND (source: ${lyricsResult.source})`);
-      transcript = lyricsResult.segments;
-      transcriptionSource = `lyrics_db:${lyricsResult.source}`;
-      jobManager.updateJob(jobId, 'transcribing', 80);
-    } else {
-      // No lyrics found, fall back to Groq
-      console.log(`[JOB ${jobId}] No lyrics found, using Groq fallback...`);
-
-      // Step 3: Download audio (only if we need Groq)
-      currentStep = 'downloading_audio';
-      console.log(`[JOB ${jobId}] Step: ${currentStep} - Downloading audio from YouTube...`);
-      jobManager.updateJob(jobId, 'downloading', 30);
-
-      try {
-        audioFilePath = await youtubeService.downloadAudio(youtubeUrl, jobId);
-        console.log(`[JOB ${jobId}] Audio downloaded to: ${audioFilePath}`);
-      } catch (downloadError) {
-        console.error(`[JOB ${jobId}] Audio download failed: ${downloadError.message}`);
-        throw new Error(`Failed to download audio: ${downloadError.message}`);
-      }
-      jobManager.updateJob(jobId, 'downloading', 50);
-
-      // Step 4: Transcribe and translate with Groq
-      currentStep = 'transcribing';
-      console.log(`[JOB ${jobId}] Step: ${currentStep} - Starting Groq transcription...`);
-      jobManager.updateJob(jobId, 'transcribing', 60);
-
-      try {
-        transcript = await transcribeService.transcribeAndTranslate(audioFilePath, {
-          videoTitle: metadata.title
-        });
-        // Note: Groq results are NOT cached - each transcription is unique to the audio
-      } catch (transcribeError) {
-        console.error(`[JOB ${jobId}] Transcription failed: ${transcribeError.message}`);
-        throw new Error(`Failed to transcribe audio: ${transcribeError.message}`);
-      }
-      transcriptionSource = 'groq_fallback';
-    }
-
-    console.log(`[JOB ${jobId}] Transcription complete. Got ${transcript.length} segments. Source: ${transcriptionSource}`);
+    console.log(`[JOB ${jobId}] Got ${transcript.length} segments`);
     jobManager.updateJob(jobId, 'transcribing', 90);
 
-    // Step 5: Deduct minutes from user's usage AFTER successful translation
+    // Step 3: Deduct usage
     let usageInfo = { minutes_used: 0, minutes_remaining: 0 };
     if (userId) {
       try {
         usageInfo = await userStorage.deductMinutes(userId, duration);
-        console.log(`[JOB ${jobId}] Deducted ${Math.ceil(duration / 60)} minutes from user ${userId}`);
-      } catch (deductError) {
-        console.error(`[JOB ${jobId}] Failed to deduct minutes:`, deductError.message);
-        // Don't fail the job for usage tracking errors
+        console.log(`[JOB ${jobId}] Deducted ${Math.ceil(duration / 60)} minutes`);
+      } catch (e) {
+        console.error(`[JOB ${jobId}] Usage tracking error:`, e.message);
       }
     }
 
-    // Step 6: Mark as complete with usage info and source
+    // Step 4: Complete
     const job = jobManager.getJob(jobId);
     jobManager.completeJob(jobId, transcript, duration);
-    // Add usage info and transcription source to the completed job
     job.minutes_used = usageInfo.minutes_used;
     job.minutes_remaining = usageInfo.minutes_remaining;
-    job.transcription_source = transcriptionSource;
-    console.log(`[JOB ${jobId}] Job completed successfully! (source: ${transcriptionSource})`);
+
+    console.log(`[JOB ${jobId}] Complete!`);
 
   } catch (error) {
-    const errorDetail = `[Step: ${currentStep}] ${error.message}`;
-    console.error(`[JOB ${jobId}] Error at step '${currentStep}':`, error.message);
-    console.error(`[JOB ${jobId}] Full error:`, error.stack || error);
-    jobManager.failJob(jobId, errorDetail);
+    console.error(`[JOB ${jobId}] Error:`, error.message);
+    jobManager.failJob(jobId, error.message);
 
   } finally {
-    // Clean up audio file (if it was downloaded)
+    // Cleanup audio file
     if (audioFilePath) {
       try {
         await fs.unlink(audioFilePath);
-        console.log(`[JOB ${jobId}] Cleaned up audio file: ${audioFilePath}`);
-      } catch (cleanupError) {
-        console.error(`[JOB ${jobId}] Failed to clean up audio file:`, cleanupError.message);
+        console.log(`[JOB ${jobId}] Cleaned up audio file`);
+      } catch (e) {
+        // Ignore cleanup errors
       }
     }
   }

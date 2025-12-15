@@ -18,6 +18,91 @@ const lyricsMintScraper = require('./lyricsMintScraper');
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 /**
+ * Check if text contains Devanagari (Hindi script)
+ */
+function hasDevanagari(text) {
+  return /[\u0900-\u097F]/.test(text);
+}
+
+/**
+ * Check for garbage/hallucinations in text
+ */
+function containsGarbage(text) {
+  const garbagePatterns = [
+    /\btu z draws\b/i,
+    /\bO beloved everything\b/i,
+    /\bas liego\b/i,
+    /\beverything is as\b/i,
+    /subscribe/i,
+    /notification/i,
+  ];
+
+  for (const pattern of garbagePatterns) {
+    if (pattern.test(text)) {
+      console.log('[LYRICS] Garbage detected:', pattern);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Transliterate Devanagari to romanized Hindi using LLM
+ */
+async function transliterateToRomanized(devanagariText, options = {}) {
+  if (!devanagariText || devanagariText.length < 10) {
+    return null;
+  }
+
+  if (!hasDevanagari(devanagariText)) {
+    return devanagariText;  // Already romanized
+  }
+
+  const { songTitle = '' } = options;
+
+  const systemPrompt = `Convert Devanagari Hindi script to romanized Hindi (English letters).
+
+RULES:
+- Output ONLY the romanized text
+- Keep the same line structure
+- Remove any garbage English text
+- Use standard romanization
+
+EXAMPLES:
+तुम ही हो → Tum hi ho
+तेरे नैना → Tere naina
+क्या छुपाऊं → Kya chupaaun`;
+
+  try {
+    console.log('[LYRICS] Transliterating Devanagari...');
+
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Transliterate:\n\n${devanagariText}` }
+      ],
+      temperature: 0.1,
+      max_tokens: 4000
+    });
+
+    let romanized = response.choices[0].message.content.trim();
+
+    // Remove any remaining Devanagari
+    if (hasDevanagari(romanized)) {
+      romanized = romanized.replace(/[\u0900-\u097F]+/g, '').replace(/\s+/g, ' ').trim();
+    }
+
+    console.log('[LYRICS] Transliteration complete:', romanized.length, 'chars');
+    return romanized;
+
+  } catch (error) {
+    console.error('[LYRICS] Transliteration error:', error.message);
+    return null;
+  }
+}
+
+/**
  * Parse YouTube video title to extract song and artist
  * Handles common Bollywood title formats:
  * - "Tum Hi Ho" Full Video Song | Arijit Singh | Aashiqui 2
@@ -336,52 +421,61 @@ async function searchLyrics(videoTitle, durationSeconds, youtubeUrl = null) {
   // 3. Try LyricsMint scraper
   const scraped = await lyricsMintScraper.fetchLyrics(title, artist);
 
-  if (scraped && scraped.romanizedLyrics) {
-    console.log(`[LYRICS] Found romanized lyrics on LyricsMint (${scraped.romanizedLyrics.length} chars)`);
+  if (scraped) {
+    let romanizedLyrics = null;
 
-    // Translate romanized Hindi to actual English (with song context for better quality)
-    const englishTranslation = await translateToEnglish(scraped.romanizedLyrics, {
-      songTitle: title,
-      artistName: artist
-    });
-
-    if (!englishTranslation) {
-      console.log('[LYRICS] Translation failed, falling back to Groq audio transcription');
-      return {
-        found: false,
-        segments: [],
-        source: null
-      };
+    // Case 1: Already have romanized lyrics
+    if (scraped.romanizedLyrics && scraped.romanizedLyrics.length > 100) {
+      console.log('[LYRICS] Got romanized lyrics from LyricsMint');
+      romanizedLyrics = scraped.romanizedLyrics;
+    }
+    // Case 2: Only have Devanagari - need to transliterate
+    else if (scraped.hindiLyrics && scraped.hindiLyrics.length > 100) {
+      console.log('[LYRICS] Got Devanagari from LyricsMint, transliterating...');
+      romanizedLyrics = await transliterateToRomanized(scraped.hindiLyrics, { songTitle: title });
     }
 
-    // Save to cache for next time
-    if (youtubeId) {
-      await lyricsDb.saveLyrics({
+    // Check for garbage in romanized text
+    if (romanizedLyrics && containsGarbage(romanizedLyrics)) {
+      console.log('[LYRICS] Romanized lyrics contain garbage, rejecting');
+      romanizedLyrics = null;
+    }
+
+    // If we have valid romanized lyrics, translate to English
+    if (romanizedLyrics && romanizedLyrics.length > 100) {
+      console.log(`[LYRICS] Have ${romanizedLyrics.length} chars of romanized lyrics`);
+
+      const englishTranslation = await translateToEnglish(romanizedLyrics, {
         songTitle: title,
-        artistName: artist,
-        youtubeId,
-        romanizedLyrics: scraped.romanizedLyrics,
-        hindiLyrics: scraped.hindiLyrics,
-        englishTranslation: englishTranslation,
-        source: 'lyricsmint'
+        artistName: artist
       });
+
+      if (englishTranslation) {
+        // Save to cache
+        if (youtubeId) {
+          await lyricsDb.saveLyrics({
+            songTitle: title,
+            artistName: artist,
+            youtubeId,
+            romanizedLyrics: romanizedLyrics,
+            hindiLyrics: scraped.hindiLyrics || null,
+            englishTranslation: englishTranslation,
+            source: 'lyricsmint'
+          });
+        }
+
+        const segments = lyricsToSegments(romanizedLyrics, englishTranslation, durationSeconds);
+        return {
+          found: true,
+          segments,
+          source: 'lyricsmint'
+        };
+      }
     }
-
-    const segments = lyricsToSegments(scraped.romanizedLyrics, englishTranslation, durationSeconds);
-    return {
-      found: true,
-      segments,
-      source: 'lyricsmint'
-    };
   }
 
-  // 4. If scraper found only Devanagari (needs transliteration), skip for now
-  if (scraped && scraped.needsTransliteration) {
-    console.log('[LYRICS] Only Devanagari found, needs transliteration - falling back to Groq');
-  }
-
-  // 5. Not found - will use Groq fallback
-  console.log('[LYRICS] No lyrics found, will use Groq fallback');
+  // 4. Fall back to Whisper
+  console.log('[LYRICS] No usable lyrics found, will use Groq Whisper fallback');
   return {
     found: false,
     segments: [],

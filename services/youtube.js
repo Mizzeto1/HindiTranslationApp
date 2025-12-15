@@ -135,6 +135,7 @@ async function downloadAudio(youtubeUrl, jobId) {
       '-o', outputTemplate,          // Output path template
       '--no-playlist',               // Don't download playlists
       '--no-warnings',               // Suppress warnings
+      '--postprocessor-args', 'ffmpeg:-ss 25 -t 330',  // Skip first 25s, max 5.5min
       youtubeUrl
     ];
 

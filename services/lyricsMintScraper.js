@@ -40,7 +40,7 @@ async function identifyArtist(songTitle) {
     console.log('[LYRICSMINT] Asking LLM to identify artist for:', songTitle);
 
     const response = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       messages: [
         {
           role: 'system',
